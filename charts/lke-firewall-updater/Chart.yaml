@@ -12,6 +12,6 @@ keywords:
   - lke
   - networking
 sources:
-  - https://github.com/linode/linode-charts
+  - https://github.com/ram-pi/linode-charts
 maintainers:
-  - name: Linode
+  - name: ram-pi
