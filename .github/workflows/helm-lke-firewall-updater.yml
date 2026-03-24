@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 0.1.0)'
+        description: "Version to release (e.g., 0.1.0)"
         required: false
         type: string
   push:
     branches:
       - main
     paths:
-      - 'charts/lke-firewall-updater/**'
-      - '.github/workflows/helm-lke-firewall-updater.yml'
+      - "charts/lke-firewall-updater/**"
+      - ".github/workflows/helm-lke-firewall-updater.yml"
     tags:
-      - 'charts/lke-firewall-updater/v*'
+      - "charts/lke-firewall-updater/v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,10 +30,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Helm
-        uses: helm/setup-helm@v3
+      - name: Install Helm
+        uses: azure/setup-helm@v5.0.0
         with:
-          version: '3'
+          version: "latest" # default is latest (stable)
+        id: install
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
