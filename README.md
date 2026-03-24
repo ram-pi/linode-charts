@@ -6,7 +6,22 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 
 | Chart | Version | Description |
 |---|---|---|
-| [lke-firewall-updater](charts/lke-firewall-updater/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/linode/linode-charts/main/charts/lke-firewall-updater/Chart.yaml)](https://github.com/linode/linode-charts/pkgs/container/lke-firewall-updater) | Syncs LKE node public IPs into a Linode Cloud Firewall rule — DaemonSet registers IPs on boot, CronJob removes stale ones |
+| [lke-firewall-updater](charts/lke-firewall-updater/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-firewall-updater/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-firewall-updater) | Syncs LKE node public IPs into a Linode Cloud Firewall rule — DaemonSet registers IPs on boot, CronJob removes stale ones |
+
+## Install from GHCR
+
+Install the published chart directly from GitHub Container Registry:
+
+```bash
+helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater \
+	--version 0.1.0 \
+	--namespace lke-firewall-updater \
+	--create-namespace \
+	--set-json 'firewall.ids=[12345]' \
+	--set linodeToken=<YOUR_LINODE_TOKEN>
+```
+
+For chart-specific values and more installation options, see [charts/lke-firewall-updater/README.md](charts/lke-firewall-updater/README.md).
 
 ## Related projects
 
