@@ -65,6 +65,7 @@ jobs:
           echo "chart=${{ steps.chart.outputs.name }}"
           echo "version=${{ steps.chart.outputs.version }}"
           echo "ref=${GITHUB_REF}"
+          echo "repository_owner=${{ github.repository_owner }}"
 
       - name: Package chart
         run: |
@@ -72,4 +73,4 @@ jobs:
 
       - name: Push to GHCR
         run: |
-          helm push ${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}.tgz oci://ghcr.io/linode
+          helm push ${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}.tgz oci://ghcr.io/${{ github.repository_owner }}
