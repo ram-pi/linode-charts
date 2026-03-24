@@ -2,11 +2,6 @@ name: Helm Chart - lke-firewall-updater
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (e.g., 0.1.0)"
-        required: false
-        type: string
   push:
     branches:
       - main
@@ -43,41 +38,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get version
-        id: version
+      - name: Read chart metadata
+        id: chart
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.version }}" != "" ]]; then
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-          elif [[ "${GITHUB_REF}" == refs/tags/charts/lke-firewall-updater/v* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/charts/lke-firewall-updater/v}" >> $GITHUB_OUTPUT
-          else
-            CHART_VERSION="$(awk '$1 == "version:" { print $2; exit }' charts/lke-firewall-updater/Chart.yaml)"
-            if [[ -z "$CHART_VERSION" ]]; then
-              echo "Failed to determine chart version from charts/lke-firewall-updater/Chart.yaml" >&2
-              exit 1
-            fi
-            echo "version=$CHART_VERSION" >> $GITHUB_OUTPUT
+          CHART_NAME="$(awk '$1 == "name:" { print $2; exit }' charts/lke-firewall-updater/Chart.yaml)"
+          CHART_VERSION="$(awk '$1 == "version:" { print $2; exit }' charts/lke-firewall-updater/Chart.yaml)"
+
+          if [[ -z "$CHART_NAME" || -z "$CHART_VERSION" ]]; then
+            echo "Failed to determine chart metadata from charts/lke-firewall-updater/Chart.yaml" >&2
+            exit 1
           fi
 
-      - name: Build metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/linode/lke-firewall-updater
-          tags: |
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=ref,event=branch
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
-          labels: |
-            org.opencontainers.image.title=lke-firewall-updater
-            org.opencontainers.image.description=Keeps a Linode Cloud Firewall rule in sync with LKE node public IPs
-            org.opencontainers.image.source=https://github.com/linode/linode-charts
-            org.opencontainers.image.vendor=Linode
+          if [[ "${GITHUB_REF}" == refs/tags/charts/lke-firewall-updater/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/charts/lke-firewall-updater/v}"
+            if [[ "$TAG_VERSION" != "$CHART_VERSION" ]]; then
+              echo "Tag version $TAG_VERSION does not match chart version $CHART_VERSION" >&2
+              exit 1
+            fi
+          fi
+
+          echo "name=$CHART_NAME" >> $GITHUB_OUTPUT
+          echo "version=$CHART_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Show chart metadata
+        run: |
+          echo "chart=${{ steps.chart.outputs.name }}"
+          echo "version=${{ steps.chart.outputs.version }}"
+          echo "ref=${GITHUB_REF}"
 
       - name: Package chart
         run: |
-          helm package charts/lke-firewall-updater --version ${{ steps.version.outputs.version }}
+          helm package charts/lke-firewall-updater
 
       - name: Push to GHCR
         run: |
-          helm push lke-firewall-updater-${{ steps.version.outputs.version }}.tgz oci://${{ steps.meta.outputs.images }}
+          helm push ${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}.tgz oci://ghcr.io/linode
