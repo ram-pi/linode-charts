@@ -1,0 +1,303 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lke-firewall-updater.fullname" . }}-scripts
+  labels:
+    {{- include "lke-firewall-updater.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  register.sh: |
+    #!/bin/sh
+    # register.sh — Runs on each node at pod start.
+    # Adds this node's public IP into the managed inbound rule across all configured firewalls,
+    # then sleeps forever to keep the DaemonSet pod alive.
+    set -e
+
+    # ── Validate required env vars ────────────────────────────────────────────
+    : "${LINODE_TOKEN:?LINODE_TOKEN is required}"
+    : "${FIREWALL_IDS:?FIREWALL_IDS is required}"
+    : "${RULE_NAME:?RULE_NAME is required}"
+    : "${RULE_PROTOCOL:?RULE_PROTOCOL is required}"
+    : "${RULE_PORTS:?RULE_PORTS is required}"
+    : "${RULE_ACTION:?RULE_ACTION is required}"
+    : "${NODE_NAME:?NODE_NAME is required}"
+
+    LINODE_API="https://api.linode.com/v4"
+    K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+    # ── Query this node from the Kubernetes API ───────────────────────────────
+    echo "INFO: querying node $NODE_NAME from Kubernetes API"
+    HTTP_CODE=$(curl -s -o /tmp/node.json -w "%{http_code}" \
+      -H "Authorization: Bearer $K8S_TOKEN" \
+      --cacert "$K8S_CA" \
+      "https://kubernetes.default.svc/api/v1/nodes/$NODE_NAME")
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "ERROR: Kubernetes API returned HTTP $HTTP_CODE querying node $NODE_NAME"
+      cat /tmp/node.json
+      exit 1
+    fi
+
+    MY_IP=$(jq -r '.status.addresses[] | select(.type=="ExternalIP") | .address' /tmp/node.json | head -1)
+    if [ -z "$MY_IP" ]; then
+      echo "ERROR: no ExternalIP found on node $NODE_NAME"
+      echo "       node addresses: $(jq -c '.status.addresses' /tmp/node.json)"
+      exit 1
+    fi
+    echo "INFO: node public IP is $MY_IP"
+    MY_CIDR="${MY_IP}/32"
+
+    # ── Determine effective rule name ─────────────────────────────────────────
+    # 1. Try the lke.k8s.io/cluster-id label (set by some LKE versions)
+    CLUSTER_ID=$(jq -r '.metadata.labels["lke.k8s.io/cluster-id"] // empty' /tmp/node.json)
+    # 2. Fall back to parsing the node name (LKE format: lke{cluster_id}-{pool_id}-{node_id})
+    if [ -z "$CLUSTER_ID" ]; then
+      CLUSTER_ID=$(echo "$NODE_NAME" | sed -n 's/^lke\([0-9]*\)-.*/\1/p')
+    fi
+    if [ -n "$CLUSTER_ID" ]; then
+      EFFECTIVE_RULE_NAME="lke-nodes-${CLUSTER_ID}"
+      echo "INFO: LKE cluster ID detected: $CLUSTER_ID — rule name is '$EFFECTIVE_RULE_NAME'"
+    else
+      EFFECTIVE_RULE_NAME="$RULE_NAME"
+      echo "INFO: cluster ID not found in label or node name — using fallback rule name '$EFFECTIVE_RULE_NAME'"
+    fi
+
+    # ── Register in each firewall ─────────────────────────────────────────────
+    OVERALL_OK=1
+    for FIREWALL_ID in $FIREWALL_IDS; do
+      echo "INFO: [fw=$FIREWALL_ID] registering $MY_CIDR"
+      FW_OK=0
+      MAX_RETRIES=10
+      attempt=1
+
+      while [ "$attempt" -le "$MAX_RETRIES" ]; do
+        if [ "$attempt" -gt 1 ]; then
+          JITTER=$(awk 'BEGIN{srand(); print int(rand()*10)+1}')
+          echo "INFO: [fw=$FIREWALL_ID] retry $attempt/$MAX_RETRIES, waiting ${JITTER}s"
+          sleep "$JITTER"
+        fi
+
+        # GET current rules
+        HTTP_CODE=$(curl -s -o /tmp/rules.json -w "%{http_code}" \
+          -H "Authorization: Bearer $LINODE_TOKEN" \
+          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "WARN: [fw=$FIREWALL_ID] GET rules returned HTTP $HTTP_CODE: $(cat /tmp/rules.json)"
+          attempt=$((attempt + 1))
+          continue
+        fi
+
+        # Locate the managed rule by label
+        EXISTING=$(jq -r --arg l "$EFFECTIVE_RULE_NAME" \
+          '.inbound[] | select(.label==$l) | .label // empty' /tmp/rules.json)
+
+        if [ -z "$EXISTING" ]; then
+          RULE_COUNT=$(jq '.inbound | length' /tmp/rules.json)
+          if [ "$RULE_COUNT" -ge 25 ]; then
+            echo "ERROR: [fw=$FIREWALL_ID] firewall has $RULE_COUNT inbound rules (Linode max is 25)"
+            echo "       Cannot add rule '$EFFECTIVE_RULE_NAME'. Remove unused rules first."
+            OVERALL_OK=0
+            break
+          fi
+          echo "INFO: [fw=$FIREWALL_ID] rule '$EFFECTIVE_RULE_NAME' not found — creating it"
+          NEW_RULE=$(jq -n \
+            --arg label  "$EFFECTIVE_RULE_NAME" \
+            --arg action "$RULE_ACTION" \
+            --arg proto  "$RULE_PROTOCOL" \
+            --arg ports  "$RULE_PORTS" \
+            --arg cidr   "$MY_CIDR" \
+            '{label:$label,action:$action,protocol:$proto,ports:$ports,
+              addresses:{ipv4:[$cidr]}}')
+          UPDATED=$(jq --argjson r "$NEW_RULE" '.inbound += [$r]' /tmp/rules.json)
+        else
+          echo "INFO: [fw=$FIREWALL_ID] merging $MY_CIDR into rule '$EFFECTIVE_RULE_NAME'"
+          UPDATED=$(jq \
+            --arg l "$EFFECTIVE_RULE_NAME" --arg cidr "$MY_CIDR" \
+            '(.inbound[] | select(.label==$l) | .addresses.ipv4) |= (. + [$cidr] | unique)' \
+            /tmp/rules.json)
+        fi
+
+        HTTP_CODE=$(curl -s -o /tmp/put.json -w "%{http_code}" \
+          -X PUT \
+          -H "Authorization: Bearer $LINODE_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$UPDATED" \
+          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
+
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "INFO: [fw=$FIREWALL_ID] registered $MY_IP successfully"
+          FW_OK=1
+          break
+        fi
+
+        echo "WARN: [fw=$FIREWALL_ID] PUT returned HTTP $HTTP_CODE: $(cat /tmp/put.json)"
+        case "$HTTP_CODE" in
+          400|401|403)
+            echo "ERROR: [fw=$FIREWALL_ID] non-retryable error"
+            OVERALL_OK=0
+            break
+            ;;
+        esac
+        attempt=$((attempt + 1))
+      done
+
+      if [ "$FW_OK" = "0" ] && [ "$OVERALL_OK" = "1" ]; then
+        echo "ERROR: [fw=$FIREWALL_ID] exhausted $MAX_RETRIES retries"
+        OVERALL_OK=0
+      fi
+    done
+
+    if [ "$OVERALL_OK" = "0" ]; then
+      echo "ERROR: one or more firewalls failed to update"
+      exit 1
+    fi
+
+    echo "INFO: all firewalls updated — sleeping"
+    exec sleep infinity
+
+  cleanup.sh: |
+    #!/bin/sh
+    # cleanup.sh — Runs on a schedule via CronJob.
+    # Removes IPs from managed firewall rules that no longer belong to any cluster node.
+    set -e
+
+    # ── Validate required env vars ────────────────────────────────────────────
+    : "${LINODE_TOKEN:?LINODE_TOKEN is required}"
+    : "${FIREWALL_IDS:?FIREWALL_IDS is required}"
+    : "${RULE_NAME:?RULE_NAME is required}"
+
+    LINODE_API="https://api.linode.com/v4"
+
+    # ── Collect live node ExternalIPs ─────────────────────────────────────────
+    echo "INFO: listing cluster nodes"
+    HTTP_CODE=$(curl -s -o /tmp/nodes.json -w "%{http_code}" \
+      -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+      --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+      "https://kubernetes.default.svc/api/v1/nodes")
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "ERROR: Kubernetes API returned HTTP $HTTP_CODE listing nodes"
+      cat /tmp/nodes.json
+      exit 1
+    fi
+
+    NODE_IPS=$(jq -r \
+      '.items[].status.addresses[] | select(.type=="ExternalIP") | .address' \
+      /tmp/nodes.json)
+    if [ -z "$NODE_IPS" ]; then
+      echo "WARN: no ExternalIPs found on any node — skipping cleanup to avoid wiping the rule"
+      echo "      (safety guard for transient API issues or internal-only clusters)"
+      exit 0
+    fi
+
+    LIVE_CIDRS=$(echo "$NODE_IPS" | awk '{print $1"/32"}' | sort -u | jq -R . | jq -s .)
+    echo "INFO: live node CIDRs: $(echo "$LIVE_CIDRS" | jq -r '.[]' | tr '\n' ' ')"
+
+    # ── Determine effective rule name ─────────────────────────────────────────
+    # 1. Try the lke.k8s.io/cluster-id label
+    CLUSTER_ID=$(jq -r \
+      '.items[0].metadata.labels["lke.k8s.io/cluster-id"] // empty' \
+      /tmp/nodes.json)
+    # 2. Fall back to parsing the node name (LKE format: lke{cluster_id}-{pool_id}-{node_id})
+    if [ -z "$CLUSTER_ID" ]; then
+      FIRST_NODE=$(jq -r '.items[0].metadata.name' /tmp/nodes.json)
+      CLUSTER_ID=$(echo "$FIRST_NODE" | sed -n 's/^lke\([0-9]*\)-.*/\1/p')
+    fi
+    if [ -n "$CLUSTER_ID" ]; then
+      EFFECTIVE_RULE_NAME="lke-nodes-${CLUSTER_ID}"
+      echo "INFO: LKE cluster ID detected: $CLUSTER_ID — rule name is '$EFFECTIVE_RULE_NAME'"
+    else
+      EFFECTIVE_RULE_NAME="$RULE_NAME"
+      echo "INFO: cluster ID not found in label or node name — using fallback rule name '$EFFECTIVE_RULE_NAME'"
+    fi
+
+    # ── Clean each firewall ───────────────────────────────────────────────────
+    OVERALL_OK=1
+    for FIREWALL_ID in $FIREWALL_IDS; do
+      echo "INFO: [fw=$FIREWALL_ID] checking for stale IPs"
+      FW_OK=0
+      MAX_RETRIES=10
+      attempt=1
+
+      while [ "$attempt" -le "$MAX_RETRIES" ]; do
+        if [ "$attempt" -gt 1 ]; then
+          JITTER=$(awk 'BEGIN{srand(); print int(rand()*10)+1}')
+          echo "INFO: [fw=$FIREWALL_ID] retry $attempt/$MAX_RETRIES, waiting ${JITTER}s"
+          sleep "$JITTER"
+        fi
+
+        HTTP_CODE=$(curl -s -o /tmp/rules.json -w "%{http_code}" \
+          -H "Authorization: Bearer $LINODE_TOKEN" \
+          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "WARN: [fw=$FIREWALL_ID] GET rules returned HTTP $HTTP_CODE: $(cat /tmp/rules.json)"
+          attempt=$((attempt + 1))
+          continue
+        fi
+
+        EXISTING=$(jq -r --arg l "$EFFECTIVE_RULE_NAME" \
+          '.inbound[] | select(.label==$l) | .label // empty' /tmp/rules.json)
+        if [ -z "$EXISTING" ]; then
+          echo "INFO: [fw=$FIREWALL_ID] rule '$EFFECTIVE_RULE_NAME' not found — nothing to clean"
+          FW_OK=1
+          break
+        fi
+
+        OLD_COUNT=$(jq --arg l "$EFFECTIVE_RULE_NAME" \
+          '[.inbound[] | select(.label==$l) | .addresses.ipv4[]] | length' /tmp/rules.json)
+
+        UPDATED=$(jq \
+          --arg l "$EFFECTIVE_RULE_NAME" --argjson live "$LIVE_CIDRS" \
+          '(.inbound[] | select(.label==$l) | .addresses.ipv4)
+             |= map(select(. as $ip | $live | index($ip) != null))' \
+          /tmp/rules.json)
+
+        NEW_COUNT=$(echo "$UPDATED" | jq --arg l "$EFFECTIVE_RULE_NAME" \
+          '[.inbound[] | select(.label==$l) | .addresses.ipv4[]] | length')
+
+        if [ "$OLD_COUNT" -eq "$NEW_COUNT" ]; then
+          echo "INFO: [fw=$FIREWALL_ID] no stale IPs — rule is up to date"
+          FW_OK=1
+          break
+        fi
+
+        REMOVED=$((OLD_COUNT - NEW_COUNT))
+        echo "INFO: [fw=$FIREWALL_ID] removing $REMOVED stale IP(s)"
+
+        HTTP_CODE=$(curl -s -o /tmp/put.json -w "%{http_code}" \
+          -X PUT \
+          -H "Authorization: Bearer $LINODE_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$UPDATED" \
+          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
+
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "INFO: [fw=$FIREWALL_ID] cleanup complete — removed $REMOVED stale IP(s)"
+          FW_OK=1
+          break
+        fi
+
+        echo "WARN: [fw=$FIREWALL_ID] PUT returned HTTP $HTTP_CODE: $(cat /tmp/put.json)"
+        case "$HTTP_CODE" in
+          400|401|403)
+            echo "ERROR: [fw=$FIREWALL_ID] non-retryable error"
+            OVERALL_OK=0
+            break
+            ;;
+        esac
+        attempt=$((attempt + 1))
+      done
+
+      if [ "$FW_OK" = "0" ] && [ "$OVERALL_OK" = "1" ]; then
+        echo "ERROR: [fw=$FIREWALL_ID] exhausted $MAX_RETRIES retries"
+        OVERALL_OK=0
+      fi
+    done
+
+    if [ "$OVERALL_OK" = "0" ]; then
+      echo "ERROR: one or more firewalls failed cleanup"
+      exit 1
+    fi
+    echo "INFO: all firewalls cleaned"

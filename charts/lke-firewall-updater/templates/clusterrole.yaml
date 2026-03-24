@@ -1,0 +1,17 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "lke-firewall-updater.fullname" . }}
+  labels:
+    {{- include "lke-firewall-updater.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  # The DaemonSet reads the node's ExternalIP and lke.k8s.io/cluster-id label
+  # via the Kubernetes API to identify the node and name the firewall rule.
+  # The CronJob lists all nodes to determine which IPs are still live.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "get"]

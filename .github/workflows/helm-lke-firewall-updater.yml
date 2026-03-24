@@ -1,0 +1,76 @@
+name: Helm Chart - lke-firewall-updater
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.1.0)'
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - 'charts/lke-firewall-updater/**'
+      - '.github/workflows/helm-lke-firewall-updater.yml'
+    tags:
+      - 'charts/lke-firewall-updater/v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.version }}" != "" ]]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            TAG="${GITHUB_REF#refs/tags/charts/lke-firewall-updater/}"
+            echo "version=$TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/linode/lke-firewall-updater
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=ref,event=branch
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=lke-firewall-updater
+            org.opencontainers.image.description=Keeps a Linode Cloud Firewall rule in sync with LKE node public IPs
+            org.opencontainers.image.source=https://github.com/linode/linode-charts
+            org.opencontainers.image.vendor=Linode
+
+      - name: Package chart
+        run: |
+          helm package charts/lke-firewall-updater --version ${{ steps.version.outputs.version }}
+
+      - name: Push to GHCR
+        run: |
+          helm push lke-firewall-updater-${{ steps.version.outputs.version }}.tgz oci://${{ steps.meta.outputs.images }}

@@ -1,0 +1,27 @@
+# Helm
+charts/*/charts/
+*.tgz
+
+# kubeconfig
+kubeconfig*.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Excalidraw
+*.excalidraw
+
+# Environment
+.env
+.env.*
+
+# Build outputs
+dist/
+bin/
