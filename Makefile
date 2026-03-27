@@ -7,6 +7,13 @@ K8S_VERSION   ?= 1.35
 NODE_TYPE     ?= g6-standard-2
 NODE_COUNT    ?= 3
 
+# ── VLAN test VM defaults ─────────────────────────────────────────────────────
+VM_LABEL      ?= vlan-test-vm
+VM_TYPE       ?= g6-nanode-1
+VM_IMAGE      ?= linode/ubuntu24.04
+VLAN_LABEL    ?= private-lke
+VLAN_IP       ?= 172.20.200.101/24
+
 # ── LKE ──────────────────────────────────────────────────────────────────────
 
 ## create-lke: Create a test LKE cluster (requires linode-cli + LINODE_TOKEN)
