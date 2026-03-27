@@ -48,6 +48,68 @@ list-lke:
 
 # ── Helm ──────────────────────────────────────────────────────────────────────
 
+## create-lke-enterprise: Create a test LKE Enterprise cluster (latest enterprise version auto-detected)
+.PHONY: create-lke-enterprise
+create-lke-enterprise:
+	$(eval ENTERPRISE_VERSION := $(shell linode-cli lke tiered-versions-list enterprise --text 2>/dev/null | awk 'NR==2 {print $$1}'))
+	@test -n "$(ENTERPRISE_VERSION)" || (echo "Could not detect latest LKE Enterprise version"; exit 1)
+	@echo "Using LKE Enterprise version: $(ENTERPRISE_VERSION)"
+	LINODE_CLI_API_VERSION=v4beta linode-cli lke cluster-create \
+		--label "$(CLUSTER_LABEL)" \
+		--region "$(REGION)" \
+		--k8s_version "$(ENTERPRISE_VERSION)" \
+		--tier enterprise \
+		--node_pools '[{"type":"$(NODE_TYPE)","count":$(NODE_COUNT)}]'
+	@echo ""
+	@echo "ACTION REQUIRED: Control Plane ACLs are enabled by default on LKE Enterprise."
+	@echo "   Add your IP to the cluster ACL in Linode Cloud Manager:"
+	@echo "   https://cloud.linode.com/kubernetes/clusters"
+	@echo "   (Cluster -> Control Plane ACL -> Add your IP)"
+	@echo "   Without this step you will not be able to reach the API server."
+
+# ── VLAN test VM ──────────────────────────────────────────────────────────────
+
+## create-vlan-vm: Create a VM with a public IP and a VLAN interface for testing
+##   Override defaults: VM_LABEL, VM_TYPE, VM_IMAGE, REGION, VLAN_LABEL, VLAN_IP
+##   Example: make create-vlan-vm VLAN_LABEL=my-vlan VLAN_IP=10.0.0.254/24
+.PHONY: create-vlan-vm
+create-vlan-vm:
+	@ROOT_PASS="$$(openssl rand -base64 24)"; \
+	RESULT=$$(linode-cli linodes create \
+		--label "$(VM_LABEL)" \
+		--region "$(REGION)" \
+		--type "$(VM_TYPE)" \
+		--image "$(VM_IMAGE)" \
+		--interfaces '[{"purpose":"public"},{"purpose":"vlan","label":"$(VLAN_LABEL)","ipam_address":"$(VLAN_IP)"}]' \
+		--root_pass "$$ROOT_PASS" \
+		--json); \
+	echo "$$RESULT" | jq -r '.[0] | "Created: \(.label) (id=\(.id))  public_ip=\(.ipv4[0])"'; \
+	PUBLIC_IP=$$(echo "$$RESULT" | jq -r '.[0].ipv4[0]'); \
+	echo ""; \
+	echo "SSH command: ssh root@$$PUBLIC_IP"; \
+	echo "Password:    $$ROOT_PASS"; \
+	echo ""; \
+	echo "NOTE: VLAN interface will be active after the first boot."; \
+	echo "      SSH in and verify with: ip addr show eth1"
+
+## delete-vlan-vm: Delete the VLAN test VM
+.PHONY: delete-vlan-vm
+delete-vlan-vm:
+	$(eval VM_ID := $(shell linode-cli linodes list --json | \
+		jq -r '.[] | select(.label=="$(VM_LABEL)") | .id'))
+	@test -n "$(VM_ID)" || (echo "VM '$(VM_LABEL)' not found"; exit 1)
+	linode-cli linodes delete $(VM_ID)
+	@echo "VM $(VM_LABEL) (id=$(VM_ID)) deleted."
+
+## list-vms: List all Linode VMs
+.PHONY: list-vms
+list-vms:
+	@{ echo "ID\tLABEL\tREGION\tTYPE\tSTATUS\tIPv4"; \
+	   linode-cli linodes list --json | jq -r '.[] | [.id, .label, .region, .type, .status, (.ipv4[0] // "-")] | @tsv'; \
+	} | column -t -s$$'\t'
+
+## Helm ──────────────────────────────────────────────────────────────────────
+
 ## lint: Lint all charts under charts/
 .PHONY: lint
 lint:
