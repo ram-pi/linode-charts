@@ -1,0 +1,21 @@
+apiVersion: v2
+name: lke-route-injector
+description: >
+  Injects static IP routes on every targeted LKE node via a DaemonSet.
+  Routes are re-applied on a configurable interval so they survive node reboots.
+  Designed for NAT gateway and VPN gateway use cases where traffic must be
+  steered through a VLAN interface.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - linode
+  - lke
+  - networking
+  - routes
+  - nat
+  - vpn
+sources:
+  - https://github.com/ram-pi/linode-charts
+maintainers:
+  - name: ram-pi

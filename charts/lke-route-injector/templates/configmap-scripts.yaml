@@ -1,0 +1,35 @@
+{{- if not .Values.routes }}
+{{- fail "lke-route-injector: routes must contain at least one entry" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lke-route-injector.fullname" . }}-scripts
+  labels:
+    {{- include "lke-route-injector.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  route-inject.sh: |
+    #!/bin/sh
+    # route-inject.sh — applies static routes on the host network namespace.
+    #
+    # hostNetwork: true gives the container access to the host routing table.
+    # NET_ADMIN capability is required for ip route commands.
+    # ip route replace is idempotent: creates or updates the route in one call.
+    #
+    # Routes are compiled into this script at Helm render time.
+    set -eu
+
+    echo "INFO: lke-route-injector started -- {{ len .Values.routes }} route(s) configured"
+
+    while true; do
+      {{- range .Values.routes }}
+      ip route replace {{ .network }} via {{ .gateway }} \
+        && echo "INFO: route {{ .network }} via {{ .gateway }} applied" \
+        || echo "WARN: failed to apply route {{ .network }} via {{ .gateway }}"
+      {{- end }}
+      sleep {{ $.Values.interval }}
+    done

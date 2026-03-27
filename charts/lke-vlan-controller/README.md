@@ -59,7 +59,7 @@ helm upgrade --install lke-vlan-controller charts/lke-vlan-controller \
 
 ```bash
 helm upgrade --install lke-vlan-controller \
-  oci://ghcr.io/akamai/linode-charts/lke-vlan-controller \
+  oci://ghcr.io/ram-pi/lke-vlan-controller \
   --namespace lke-vlan-controller \
   --create-namespace \
   --set vlan.name=my-private-vlan \
@@ -76,7 +76,7 @@ kubectl create secret generic linode-token \
   --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install lke-vlan-controller \
-  oci://ghcr.io/akamai/linode-charts/lke-vlan-controller \
+  oci://ghcr.io/ram-pi/lke-vlan-controller \
   --namespace lke-vlan-controller \
   --create-namespace \
   --set vlan.name=my-private-vlan \

@@ -1,0 +1,57 @@
+# -- List of static routes to inject on every targeted node.
+# REQUIRED — the chart will fail to render if this list is empty.
+# Use network: "0.0.0.0/0" to replace the default route (e.g. NAT/VPN gateways).
+# WARNING: replacing the default route (0.0.0.0/0) redirects all outbound traffic
+# through the specified gateway. Ensure the gateway has upstream connectivity,
+# otherwise the node will lose access to the Kubernetes API server.
+routes: []
+# Example:
+#   - network: 10.0.0.0/8
+#     gateway: 172.20.200.1
+#   - network: 0.0.0.0/0
+#     gateway: 172.20.200.1
+
+# -- Seconds between route re-apply loops.
+# Routes are re-applied at this interval so any transient loss is corrected quickly.
+interval: 60
+
+namespace:
+  # -- Create the namespace as part of this Helm release.
+  # Set to false if you manage namespaces externally (e.g. via GitOps).
+  create: true
+
+deployment:
+  image:
+    repository: alpine
+    tag: "3.21.3"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "64Mi"
+    limits:
+      cpu: "50m"
+      memory: "128Mi"
+  # -- Node selector applied to the DaemonSet pod. Default {} targets ALL nodes.
+  nodeSelector: {}
+  # -- Tolerations for the DaemonSet pod.
+  tolerations: []
+  # -- When true, run only on nodes that have the vlan-ip label (any value).
+  # Uses nodeAffinity with operator: Exists so the exact IP value is not required.
+  # lke-vlan-controller sets this label after a successful reboot.
+  vlanNodesOnly: false
+
+serviceAccount:
+  # -- If true, create a ServiceAccount. Set to false to bring your own.
+  create: true
+  # -- Name override. Defaults to the chart fullname.
+  name: ""
+  annotations: {}
+
+# -- Labels added to all resources.
+commonLabels: {}
+# -- Annotations added to all resources.
+commonAnnotations: {}
+
+nameOverride: ""
+fullnameOverride: ""

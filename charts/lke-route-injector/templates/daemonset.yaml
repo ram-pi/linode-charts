@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "lke-route-injector.fullname" . }}
+  labels:
+    {{- include "lke-route-injector.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lke-route-injector.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-route-injector.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Restart pods when the route ConfigMap changes (e.g. new routes added).
+        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lke-route-injector.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # hostNetwork shares the host network namespace so ip route affects the
+      # actual node routing table, not just the container's private namespace.
+      hostNetwork: true
+      # ClusterFirstWithHostNet preserves cluster DNS resolution when hostNetwork is true.
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 5
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.deployment.vlanNodesOnly }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: vlan-ip
+                    operator: Exists
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "lke-route-injector.fullname" . }}-scripts
+            defaultMode: 0555
+      containers:
+        - name: route-injector
+          image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+          imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          # Install iproute2 (provides the ip command) then run the inject loop.
+          command: ["/bin/sh", "-c"]
+          args:
+            - "apk add --no-cache iproute2 >/dev/null 2>&1 && /scripts/route-inject.sh"
+          securityContext:
+            # NET_ADMIN is required for ip route commands.
+            # Full privilege is not needed.
+            capabilities:
+              add: ["NET_ADMIN"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}

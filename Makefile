@@ -114,6 +114,39 @@ create-vlan-vm:
 	echo "NOTE: VLAN interface will be active after the first boot."; \
 	echo "      SSH in and verify with: ip addr show eth1"
 
+## nat-gateway-setup: Print the commands to configure VM_LABEL as a NAT gateway
+##   Run after create-vlan-vm. Requires the VM to be running (eth1 = VLAN interface).
+##   Example: make nat-gateway-setup VM_LABEL=vlan-test-vm
+.PHONY: nat-gateway-setup
+nat-gateway-setup:
+	$(eval VM_IP := $(shell linode-cli linodes list --json | \
+		jq -r '.[] | select(.label=="$(VM_LABEL)") | .ipv4[0]'))
+	@test -n "$(VM_IP)" || (echo "VM '$(VM_LABEL)' not found"; exit 1)
+	@echo ""
+	@echo "══ NAT gateway setup for $(VM_LABEL) ($(VM_IP)) ══════════════════════════"
+	@echo ""
+	@echo "1. SSH into the VM:"
+	@echo "   ssh root@$(VM_IP)"
+	@echo ""
+	@echo "2. Run the following commands on the VM:"
+	@echo ""
+	@echo "   # Enable IP forwarding (persistent across reboots)"
+	@echo "   sysctl -w net.ipv4.ip_forward=1"
+	@echo "   echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf"
+	@echo ""
+	@echo "   # Allow forwarding between VLAN (eth1) and public (eth0)"
+	@echo "   iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT"
+	@echo "   iptables -A FORWARD -i eth0 -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT"
+	@echo ""
+	@echo "   # Masquerade outbound traffic so replies return to the correct node"
+	@echo "   iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+	@echo ""
+	@echo "   # (Optional) Persist iptables rules across reboots"
+	@echo "   apt-get install -y iptables-persistent && netfilter-persistent save"
+	@echo ""
+	@echo "══════════════════════════════════════════════════════════════════════════"
+	@echo ""
+
 ## delete-vlan-vm: Delete the VLAN test VM
 .PHONY: delete-vlan-vm
 delete-vlan-vm:
