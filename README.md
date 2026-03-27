@@ -7,6 +7,8 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 | Chart | Version | Description |
 |---|---|---|
 | [lke-firewall-updater](charts/lke-firewall-updater/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-firewall-updater/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-firewall-updater) | Syncs LKE node public IPs into a Linode Cloud Firewall rule — DaemonSet registers IPs on boot, CronJob removes stale ones |
+| [lke-vlan-controller](charts/lke-vlan-controller/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller) | Attaches a VLAN interface to every node in a standard LKE cluster with rolling reboots and IPAM |
+| [lke-vlan-controller-enterprise](charts/lke-vlan-controller-enterprise/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller-enterprise/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller-enterprise) | Variant of lke-vlan-controller for LKE Enterprise clusters (VPC-aware: shuts down nodes before config update, disables Linode Network Helper) |
 
 ## Install from GHCR
 
@@ -74,6 +76,9 @@ make create-lke
 
 # Override any default
 make create-lke CLUSTER_LABEL=my-test REGION=us-east NODE_COUNT=2
+
+# Create an LKE Enterprise cluster (latest enterprise version auto-detected)
+make create-lke-enterprise
 
 # Download kubeconfig once the cluster is ready
 make kubeconfig
