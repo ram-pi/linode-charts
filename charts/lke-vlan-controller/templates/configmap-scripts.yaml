@@ -317,6 +317,20 @@ data:
           continue
         fi
 
+        # Skip nodes that carry the exclusion label (any non-empty value triggers skip).
+        # Reads from the already-cached /tmp/nodes.json — no extra API calls.
+        if [ -n "$EXCLUDE_LABEL_KEY" ]; then
+          EXCLUDE_VAL=$(jq -r \
+            --arg n "$NODE_NAME" \
+            --arg key "$EXCLUDE_LABEL_KEY" \
+            '.items[] | select(.metadata.name==$n) | .metadata.labels[$key] // empty' \
+            /tmp/nodes.json)
+          if [ -n "$EXCLUDE_VAL" ]; then
+            echo "INFO: node $NODE_NAME excluded (${EXCLUDE_LABEL_KEY}=${EXCLUDE_VAL}) -- skipping"
+            continue
+          fi
+        fi
+
         CONFIGS=$(linode-cli linodes configs-list "$LINODE_ID" --json 2>/dev/null)
         CONFIG_ID=$(echo "$CONFIGS" | jq -r '.[0].id')
         if [ -z "$CONFIG_ID" ] || [ "$CONFIG_ID" = "null" ]; then

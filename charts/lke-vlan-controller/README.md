@@ -103,11 +103,30 @@ helm upgrade --install lke-vlan-controller \
 | `deployment.tolerations` | Tolerations for the controller pod | `[]` |
 | `reboot.enabled` | Reboot each Linode after VLAN attachment | `true` |
 | `reboot.waitTimeoutSeconds` | Seconds to wait for the node to return to Ready after reboot | `600` |
+| `exclusion.labelKey` | Label key that marks a node as excluded from VLAN assignment; any non-empty value skips the node; set to `""` to disable | `lke-vlan-exclude` |
 | `serviceAccount.create` | Create a ServiceAccount for the controller | `true` |
 | `leaderElection.leaseDurationSeconds` | Seconds a Lease is valid without renewal; standby takes over after expiry | `15` |
 | `leaderElection.renewIntervalSeconds` | How often the leader renews the Lease | `5` |
 | `commonLabels` | Labels added to all resources | `{}` |
 | `commonAnnotations` | Annotations added to all resources | `{}` |
+
+---
+
+## Excluding nodes
+
+To prevent the controller from attaching a VLAN interface to specific nodes, label them with `lke-vlan-exclude`:
+
+```bash
+# Exclude a single node (useful for testing)
+kubectl label node <node-name> lke-vlan-exclude=true
+
+# Remove the exclusion (node will be processed on the next iteration)
+kubectl label node <node-name> lke-vlan-exclude-
+```
+
+For permanent exclusion of an entire node pool, add the label `lke-vlan-exclude=true` to the node pool in the [Linode Cloud Manager](https://cloud.linode.com) under **Kubernetes → your cluster → Node Pools**. All nodes in the pool will inherit the label automatically.
+
+The label value is not significant — any non-empty value causes the node to be skipped. To disable the feature entirely for all nodes, set `exclusion.labelKey: ""` in `values.yaml`.
 
 ---
 

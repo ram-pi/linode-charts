@@ -46,6 +46,21 @@ delete-lke:
 	linode-cli lke cluster-delete $(CLUSTER_ID)
 	@echo "Cluster $(CLUSTER_LABEL) (id=$(CLUSTER_ID)) deleted."
 
+## add-excluded-pool: Add a node pool labelled lke-vlan-controller/exclude=true to CLUSTER_LABEL
+##   Override defaults: CLUSTER_LABEL, NODE_TYPE, EXCLUDE_POOL_COUNT
+##   Example: make add-excluded-pool CLUSTER_LABEL=my-cluster EXCLUDE_POOL_COUNT=2
+EXCLUDE_POOL_COUNT ?= 1
+.PHONY: add-excluded-pool
+add-excluded-pool:
+	$(eval CLUSTER_ID := $(shell linode-cli lke clusters-list --json | \
+		jq -r '.[] | select(.label=="$(CLUSTER_LABEL)") | .id'))
+	@test -n "$(CLUSTER_ID)" || (echo "Cluster '$(CLUSTER_LABEL)' not found"; exit 1)
+	linode-cli lke pool-create $(CLUSTER_ID) \
+		--type "$(NODE_TYPE)" \
+		--count $(EXCLUDE_POOL_COUNT) \
+		--labels '{"lke-vlan-exclude":"true"}'
+	@echo "Node pool (type=$(NODE_TYPE) count=$(EXCLUDE_POOL_COUNT)) added to cluster $(CLUSTER_LABEL) with lke-vlan-exclude=true"
+
 ## list-lke: List all LKE clusters
 .PHONY: list-lke
 list-lke:

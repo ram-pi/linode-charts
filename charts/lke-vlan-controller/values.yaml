@@ -49,6 +49,13 @@ reboot:
   # -- Seconds to wait for a node to become Ready after reboot before timing out.
   waitTimeoutSeconds: 600
 
+exclusion:
+  # -- Label key used to exclude nodes from VLAN assignment and reboots.
+  # Any node carrying this label (with any non-empty value) is silently skipped.
+  # Apply the label to an LKE node pool in the Linode Cloud Manager to exclude
+  # all nodes in that pool. Set to "" to disable the exclusion feature entirely.
+  labelKey: "lke-vlan-exclude"
+
 serviceAccount:
   # -- If true, create a ServiceAccount. Set to false to bring your own.
   create: true
