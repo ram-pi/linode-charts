@@ -41,6 +41,9 @@ data:
     : "${MY_POD_NAME:?MY_POD_NAME is required}"
     : "${MY_NAMESPACE:?MY_NAMESPACE is required}"
     : "${MY_NODE_NAME:?MY_NODE_NAME is required}"
+    : "${LEASE_NAME:?LEASE_NAME is required}"
+    : "${LEASE_DURATION_SECONDS:?LEASE_DURATION_SECONDS is required}"
+    : "${RENEW_INTERVAL_SECONDS:?RENEW_INTERVAL_SECONDS is required}"
 
     # Activate Python virtual environment where linode-cli is installed
     . /opt/venv/bin/activate
@@ -136,6 +139,7 @@ data:
       echo "INFO: waiting for node $node_name to go NotReady (timeout ${timeout}s)"
       while [ "$elapsed" -lt "$timeout" ]; do
         sleep "$interval"
+        renew_lease
         elapsed=$((elapsed + interval))
         status=$(curl -s \
           -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
@@ -159,6 +163,7 @@ data:
       echo "INFO: waiting for node $node_name to become Ready (timeout ${timeout}s)"
       while [ "$elapsed" -lt "$timeout" ]; do
         sleep "$interval"
+        renew_lease
         elapsed=$((elapsed + interval))
         status=$(curl -s \
           -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
@@ -187,8 +192,100 @@ data:
       printf '%s\n' "$statuses" | grep -qv '^True$' && return 1 || return 0
     }
 
+    # ── Leader election helpers ────────────────────────────────────────────────
+    # GET the Lease; write response body to $1, return HTTP code.
+    lease_get() {
+      local out="$1"
+      curl -s -o "$out" -w "%{http_code}" \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}"
+    }
+
+    # PUT (full replace) the Lease with holderIdentity=MY_POD_NAME.
+    # The supplied resourceVersion enables etcd compare-and-swap: concurrent
+    # PUTs with the same resourceVersion are serialised — exactly one wins.
+    lease_put() {
+      local resource_version="$1" body out code
+      out=$(mktemp /tmp/lease_put.XXXXXX)
+      body=$(printf '{
+        "apiVersion":"coordination.k8s.io/v1","kind":"Lease",
+        "metadata":{"name":"%s","namespace":"%s","resourceVersion":"%s"},
+        "spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}
+      }' "$LEASE_NAME" "$MY_NAMESPACE" "$resource_version" \
+         "$MY_POD_NAME" "$LEASE_DURATION_SECONDS" "$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)")
+      code=$(curl -s -o "$out" -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        -H "Content-Type: application/json" \
+        --cacert "$K8S_CA" \
+        --data "$body" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}")
+      rm -f "$out"
+      [ "$code" = "200" ]
+    }
+
+    # Loop until this pod holds the Lease.
+    # If two pods race on the same empty/expired Lease they PUT the same
+    # resourceVersion; etcd accepts exactly one — the loser gets 409 and retries.
+    acquire_lease() {
+      echo "INFO: acquiring leader Lease ${LEASE_NAME}"
+      while true; do
+        local f code holder rv dur renew_ts renew_epoch now expired_at
+        f=$(mktemp /tmp/lease_get.XXXXXX)
+        code=$(lease_get "$f")
+        if [ "$code" = "200" ]; then
+          holder=$(jq -r '.spec.holderIdentity // empty' "$f")
+          rv=$(jq -r '.metadata.resourceVersion' "$f")
+          dur=$(jq -r '.spec.leaseDurationSeconds // empty' "$f")
+          renew_ts=$(jq -r '.spec.renewTime // empty' "$f")
+          rm -f "$f"
+          if [ "$holder" = "$MY_POD_NAME" ] || [ -z "$holder" ] || [ -z "$renew_ts" ]; then
+            lease_put "$rv" && echo "INFO: leader Lease acquired" && return 0
+            # 409 conflict: another pod raced us — fall through to sleep
+          else
+            renew_epoch=$(date -d "$renew_ts" +%s 2>/dev/null || echo 0)
+            now=$(date -u +%s)
+            expired_at=$((renew_epoch + ${dur:-15}))
+            if [ "$now" -gt "$expired_at" ]; then
+              echo "INFO: Lease held by $holder is expired, taking over"
+              lease_put "$rv" && echo "INFO: leader Lease acquired" && return 0
+            else
+              echo "INFO: Lease held by $holder (expires in $((expired_at - now))s) -- standby"
+            fi
+          fi
+        else
+          rm -f "$f"
+        fi
+        sleep "$RENEW_INTERVAL_SECONDS"
+      done
+    }
+
+    # Renew the Lease.  Called inside poll loops and at the end of each main
+    # iteration to keep the Lease alive during long operations.
+    # If another pod stole the Lease (e.g. leader GC'd), exit immediately so
+    # the Deployment restarts this pod as a fresh standby.
+    renew_lease() {
+      local f code holder rv
+      f=$(mktemp /tmp/lease_renew.XXXXXX)
+      code=$(lease_get "$f")
+      if [ "$code" != "200" ]; then
+        echo "WARN: Lease GET failed (HTTP $code) -- will retry"
+        rm -f "$f"; return 0
+      fi
+      holder=$(jq -r '.spec.holderIdentity // empty' "$f")
+      rv=$(jq -r '.metadata.resourceVersion' "$f")
+      rm -f "$f"
+      if [ "$holder" != "$MY_POD_NAME" ]; then
+        echo "ERROR: Lease was taken by $holder -- exiting to yield to new leader"
+        exit 1
+      fi
+      lease_put "$rv" || echo "WARN: Lease renewal failed -- will retry"
+    }
+
     # ── Main loop ─────────────────────────────────────────────────────────────
     echo "INFO: lke-vlan-controller started -- VLAN=${VLAN_NAME} CIDR=${VLAN_CIDR}"
+
+    acquire_lease
 
     while true; do
 
@@ -400,5 +497,6 @@ data:
         # MY_NODE_NAME != $NODE_NAME -> goes through the normal reboot path.
       fi
 
+      renew_lease
       sleep 60
     done

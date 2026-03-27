@@ -9,10 +9,10 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  # Single replica ensures the reconciliation loop is serialised:
-  # only one goroutine assigns IPs and reboots nodes at a time,
-  # preventing IP collision races without distributed locking.
-  replicas: 1
+  # Leader election via a Kubernetes Lease ensures only one pod runs the
+  # reconciliation loop at a time regardless of replica count.  Extra replicas
+  # wait on standby and take over automatically if the leader crashes.
+  replicas: {{ .Values.deployment.replicas }}
   selector:
     matchLabels:
       {{- include "lke-vlan-controller.selectorLabels" . | nindent 6 }}
@@ -47,7 +47,7 @@ spec:
           # linode-cli is configured via LINODE_CLI_TOKEN (no config file needed).
           command: ["/bin/sh", "-c"]
           args:
-            - "apk add --no-cache python3 py3-pip curl jq nmap >/dev/null 2>&1 && python3 -m venv /opt/venv && . /opt/venv/bin/activate && pip install linode-cli >/dev/null 2>&1 && /scripts/register.sh"
+            - "apk add --no-cache python3 py3-pip curl jq nmap coreutils >/dev/null 2>&1 && python3 -m venv /opt/venv && . /opt/venv/bin/activate && pip install linode-cli >/dev/null 2>&1 && /scripts/register.sh"
           env:
             - name: LINODE_CLI_TOKEN
               valueFrom:
@@ -74,6 +74,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: LEASE_NAME
+              value: {{ include "lke-vlan-controller.fullname" . }}-leader
+            - name: LEASE_DURATION_SECONDS
+              value: {{ .Values.leaderElection.leaseDurationSeconds | quote }}
+            - name: RENEW_INTERVAL_SECONDS
+              value: {{ .Values.leaderElection.renewIntervalSeconds | quote }}
           volumeMounts:
             - name: scripts
               mountPath: /scripts

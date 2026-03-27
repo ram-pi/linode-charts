@@ -20,3 +20,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "delete"]
+
+  # Leader election: the controller acquires and renews a Lease so that only
+  # one pod runs the reconciliation loop even when replicas > 1.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]

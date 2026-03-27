@@ -22,6 +22,11 @@ namespace:
   create: true
 
 deployment:
+  # Number of controller replicas.  Only one pod runs the reconciliation loop
+  # at a time (enforced via Kubernetes Lease leader election); extra replicas
+  # act as hot standbys that take over within leaseDurationSeconds if the
+  # leader crashes.
+  replicas: 2
   image:
     repository: alpine
     tag: "3.21.3"
@@ -55,6 +60,14 @@ serviceAccount:
 commonLabels: {}
 # -- Annotations added to all resources.
 commonAnnotations: {}
+
+leaderElection:
+  # Seconds a Lease is valid without renewal.  After expiry a standby pod
+  # takes over.  Must be greater than renewIntervalSeconds.
+  leaseDurationSeconds: 15
+  # How often the leader renews its Lease.  Called inside wait_node_ready /
+  # wait_node_not_ready poll loops so the Lease stays alive during reboots.
+  renewIntervalSeconds: 5
 
 nameOverride: ""
 fullnameOverride: ""
