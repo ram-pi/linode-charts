@@ -1,0 +1,404 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lke-vlan-controller.fullname" . }}-scripts
+  labels:
+    {{- include "lke-vlan-controller.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  register.sh: |
+    #!/bin/sh
+    # register.sh — Stateless VLAN controller for Standard LKE.
+    #
+    # Reconciliation logic (runs every 60s):
+    #   1. List all Kubernetes nodes.
+    #   2. Classify each node via the Linode API:
+    #        needs_config  — VLAN interface absent from Linode config
+    #        needs_reboot  — VLAN in config, vlan-ip label absent from K8s node
+    #        done          — VLAN in config AND vlan-ip label present
+    #   3. For needs_config nodes: assign a free IP, update the Linode config,
+    #      then add to needs_reboot.
+    #   4. Reboot needs_reboot nodes one at a time (rolling, serialised).
+    #        MY_NODE is always processed last: all other nodes are rebooted and
+    #        Ready before the controller pod migrates, so at most ONE node is ever
+    #        cordoned and a schedulable node is always available for the new pod.
+    #   5. Set the vlan-ip label only after the node is back to Ready.
+    #      This label is the completion marker: its absence means "reboot still
+    #      needed", making the controller fully stateless across pod restarts.
+    #
+    # No annotations are used for control flow.
+    set -eu
+
+    # ── Validate required env vars ────────────────────────────────────────────
+    : "${LINODE_CLI_TOKEN:?LINODE_CLI_TOKEN is required}"
+    : "${VLAN_NAME:?VLAN_NAME is required}"
+    : "${VLAN_CIDR:?VLAN_CIDR is required}"
+    : "${REBOOT_ENABLED:?REBOOT_ENABLED is required}"
+    : "${REBOOT_TIMEOUT:?REBOOT_TIMEOUT is required}"
+    : "${MY_POD_NAME:?MY_POD_NAME is required}"
+    : "${MY_NAMESPACE:?MY_NAMESPACE is required}"
+    : "${MY_NODE_NAME:?MY_NODE_NAME is required}"
+
+    # Activate Python virtual environment where linode-cli is installed
+    . /opt/venv/bin/activate
+
+    K8S_TOKEN_FILE=/var/run/secrets/kubernetes.io/serviceaccount/token
+    K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    K8S_API="https://kubernetes.default.svc"
+
+    # ── Helper: call Kubernetes API (GET) ────────────────────────────────────
+    k8s_get() {
+      local path="$1" out="$2"
+      local code
+      code=$(curl -s -o "$out" -w "%{http_code}" \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}${path}")
+      if [ "$code" != "200" ]; then
+        echo "ERROR: Kubernetes API ${path} returned HTTP ${code}: $(cat "$out")"
+        return 1
+      fi
+    }
+
+    # ── Helper: call Kubernetes API (PATCH) ──────────────────────────────────
+    k8s_patch() {
+      local path="$1" body="$2" out
+      out=$(mktemp /tmp/k8s_patch.XXXXXX)
+      local code
+      code=$(curl -s -o "$out" -w "%{http_code}" \
+        -X PATCH \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        -H "Content-Type: application/strategic-merge-patch+json" \
+        --cacert "$K8S_CA" \
+        --data "$body" \
+        "${K8S_API}${path}")
+      if [ "$code" != "200" ]; then
+        echo "ERROR: Kubernetes PATCH ${path} returned HTTP ${code}: $(cat "$out")"
+        rm -f "$out"
+        return 1
+      fi
+      rm -f "$out"
+    }
+
+    # ── Helper: label a node ──────────────────────────────────────────────────
+    label_node() {
+      local node_name="$1" key="$2" value="$3" patch
+      patch=$(printf '{"metadata":{"labels":{"%s":"%s"}}}' "$key" "$value")
+      echo "INFO: labelling node $node_name: $key=$value"
+      k8s_patch "/api/v1/nodes/${node_name}" "$patch"
+    }
+
+    # ── Helper: cordon / uncordon a node ─────────────────────────────────────
+    cordon_node() {
+      echo "INFO: cordoning node $1"
+      k8s_patch "/api/v1/nodes/$1" '{"spec":{"unschedulable":true}}'
+    }
+    uncordon_node() {
+      echo "INFO: uncordoning node $1"
+      k8s_patch "/api/v1/nodes/$1" '{"spec":{"unschedulable":false}}'
+    }
+
+    # ── Helper: migrate this pod off its node ─────────────────────────────────
+    # Cordons the node first so the scheduler places the replacement pod
+    # elsewhere, then deletes this pod and exits.  Called only after all other
+    # nodes have been rebooted, so exactly one node is ever cordoned.
+    evict_self() {
+      echo "INFO: deleting self (pod $MY_POD_NAME) to reschedule on another node"
+      curl -s -X DELETE \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}/api/v1/namespaces/${MY_NAMESPACE}/pods/${MY_POD_NAME}" >/dev/null
+      sleep 30
+      exit 0
+    }
+
+    # ── Helper: generate first free IP from CIDR ─────────────────────────────
+    generate_ip() {
+      local cidr="$1" used_file="$2"
+      nmap -sL -n "$cidr" 2>/dev/null \
+        | awk '/Nmap scan report/{print $NF}' \
+        | awk 'NR>1' \
+        | while IFS= read -r ip; do
+            if ! grep -qxF "$ip" "$used_file" 2>/dev/null; then
+              echo "$ip"
+              return 0
+            fi
+          done
+    }
+
+    # ── Helper: wait for node to go NotReady (post-reboot signal) ────────────
+    wait_node_not_ready() {
+      local node_name="$1" timeout=120
+      local elapsed=0 interval=10 status
+      echo "INFO: waiting for node $node_name to go NotReady (timeout ${timeout}s)"
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+        status=$(curl -s \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          --cacert "$K8S_CA" \
+          "${K8S_API}/api/v1/nodes/${node_name}" \
+          | jq -r '.status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || true)
+        if [ "$status" != "True" ]; then
+          echo "INFO: node $node_name is NotReady (after ${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: node $node_name still Ready (${elapsed}s elapsed)"
+      done
+      echo "WARN: node $node_name did not go NotReady within ${timeout}s — proceeding anyway"
+      return 0
+    }
+
+    # ── Helper: wait for node to become Ready ────────────────────────────────
+    wait_node_ready() {
+      local node_name="$1" timeout="${REBOOT_TIMEOUT:-300}"
+      local elapsed=0 interval=15 status
+      echo "INFO: waiting for node $node_name to become Ready (timeout ${timeout}s)"
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+        status=$(curl -s \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          --cacert "$K8S_CA" \
+          "${K8S_API}/api/v1/nodes/${node_name}" \
+          | jq -r '.status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || true)
+        if [ "$status" = "True" ]; then
+          echo "INFO: node $node_name is Ready (after ${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: node $node_name not yet Ready (${elapsed}s elapsed)"
+      done
+      echo "ERROR: node $node_name did not become Ready within ${timeout}s"
+      return 1
+    }
+
+    # ── Helper: true if all nodes are Ready (scheduling state is ignored) ─────
+    cluster_all_ready() {
+      local statuses
+      statuses=$(curl -s \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}/api/v1/nodes" \
+        | jq -r '.items[].status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || true)
+      [ -n "$statuses" ] || return 1
+      printf '%s\n' "$statuses" | grep -qv '^True$' && return 1 || return 0
+    }
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    echo "INFO: lke-vlan-controller started -- VLAN=${VLAN_NAME} CIDR=${VLAN_CIDR}"
+
+    while true; do
+
+      # ── 1. List all cluster nodes ──────────────────────────────────────────
+      if ! k8s_get "/api/v1/nodes" /tmp/nodes.json; then
+        echo "WARN: failed to list nodes -- retrying in 60s"
+        sleep 60
+        continue
+      fi
+      NODE_NAMES=$(jq -r '.items[].metadata.name' /tmp/nodes.json)
+      if [ -z "$NODE_NAMES" ]; then
+        echo "WARN: no nodes found -- retrying in 60s"
+        sleep 60
+        continue
+      fi
+
+      # ── 2. Classify each node ─────────────────────────────────────────────
+      # NEEDS_CONFIG: "NODE:LINODE_ID:CONFIG_ID"   — no VLAN in Linode config
+      # NEEDS_REBOOT: "NODE:LINODE_ID:IP_LABEL"    — VLAN in config, no vlan-ip label
+      NEEDS_CONFIG=""
+      NEEDS_REBOOT=""
+
+      for NODE_NAME in $NODE_NAMES; do
+        LINODE_ID=$(linode-cli linodes list --json 2>/dev/null \
+          | jq -r --arg label "$NODE_NAME" '.[] | select(.label==$label) | .id' \
+          | head -1)
+        if [ -z "$LINODE_ID" ]; then
+          echo "WARN: no Linode found for node $NODE_NAME -- skipping"
+          continue
+        fi
+
+        CONFIGS=$(linode-cli linodes configs-list "$LINODE_ID" --json 2>/dev/null)
+        CONFIG_ID=$(echo "$CONFIGS" | jq -r '.[0].id')
+        if [ -z "$CONFIG_ID" ] || [ "$CONFIG_ID" = "null" ]; then
+          echo "WARN: no config found for Linode $LINODE_ID (node $NODE_NAME) -- skipping"
+          continue
+        fi
+
+        HAS_VLAN=$(echo "$CONFIGS" | jq -r \
+          --arg vlan "$VLAN_NAME" \
+          '.[0].interfaces[]? | select(.purpose=="vlan" and .label==$vlan) | .label // empty' \
+          2>/dev/null | head -1)
+        HAS_PUBLIC=$(echo "$CONFIGS" | jq -r \
+          '.[0].interfaces[]? | select(.purpose=="public") | .purpose // empty' \
+          2>/dev/null | head -1)
+
+        if [ -z "$HAS_VLAN" ] || [ -z "$HAS_PUBLIC" ]; then
+          echo "INFO: node $NODE_NAME needs VLAN config"
+          NEEDS_CONFIG="$NEEDS_CONFIG $NODE_NAME:$LINODE_ID:$CONFIG_ID"
+        else
+          # VLAN is in the Linode config.  The vlan-ip label is the completion
+          # marker: it is set only after the node returns to Ready post-reboot.
+          # If absent, the node was configured but never rebooted (or was
+          # recycled), so a reboot is still required.
+          HAS_LABEL=$(jq -r \
+            --arg n "$NODE_NAME" \
+            '.items[] | select(.metadata.name==$n) | .metadata.labels["vlan-ip"] // empty' \
+            /tmp/nodes.json)
+          if [ -z "$HAS_LABEL" ]; then
+            VLAN_IP_LABEL=$(echo "$CONFIGS" | jq -r \
+              --arg vlan "$VLAN_NAME" \
+              '.[0].interfaces[] | select(.purpose=="vlan" and .label==$vlan) | .ipam_address' \
+              | tr '/' '_')
+            echo "INFO: node $NODE_NAME has VLAN config but no vlan-ip label -- needs reboot"
+            NEEDS_REBOOT="$NEEDS_REBOOT $NODE_NAME:$LINODE_ID:$VLAN_IP_LABEL"
+          else
+            echo "INFO: node $NODE_NAME is done (vlan-ip=$HAS_LABEL)"
+          fi
+        fi
+      done
+
+      if [ -z "$NEEDS_CONFIG" ] && [ -z "$NEEDS_REBOOT" ]; then
+        echo "INFO: all nodes configured and active -- sleeping 60s"
+        sleep 60
+        continue
+      fi
+
+      # ── 3. Assign VLAN IPs and update Linode configs ──────────────────────
+      if [ -n "$NEEDS_CONFIG" ]; then
+        USED_IPS_FILE=$(mktemp /tmp/used_ips.XXXXXX)
+
+        VLAN_LINODES=$(curl -s \
+          -H "Authorization: Bearer ${LINODE_CLI_TOKEN}" \
+          "https://api.linode.com/v4beta/networking/vlans" \
+          | jq -r --arg vlan "$VLAN_NAME" \
+              '.data[] | select(.label==$vlan) | .linodes[]' 2>/dev/null || true)
+
+        for VL_ID in $VLAN_LINODES; do
+          linode-cli linodes configs-list "$VL_ID" --json 2>/dev/null \
+            | jq -r \
+              --arg vlan "$VLAN_NAME" \
+              '.[].interfaces[] | select(.purpose=="vlan" and .label==$vlan) | .ipam_address // empty' \
+            | sed 's|/[0-9]*$||' \
+            >> "$USED_IPS_FILE" 2>/dev/null || true
+        done
+        echo "INFO: used IPs on VLAN ${VLAN_NAME}: $(tr '\n' ' ' < "$USED_IPS_FILE")"
+
+        for ENTRY in $NEEDS_CONFIG; do
+          NODE_NAME=$(echo "$ENTRY" | cut -d: -f1)
+          LINODE_ID=$(echo "$ENTRY" | cut -d: -f2)
+          CONFIG_ID=$(echo "$ENTRY" | cut -d: -f3)
+
+          NEW_IP=$(generate_ip "$VLAN_CIDR" "$USED_IPS_FILE")
+          if [ -z "$NEW_IP" ]; then
+            echo "ERROR: CIDR $VLAN_CIDR is exhausted -- no free IPs"
+            break
+          fi
+          IPAM="${NEW_IP}/24"
+          echo "INFO: assigning $IPAM to node $NODE_NAME (Linode $LINODE_ID)"
+          echo "$NEW_IP" >> "$USED_IPS_FILE"
+
+          CURRENT_CONFIG=$(linode-cli linodes config-view "$LINODE_ID" "$CONFIG_ID" --json 2>/dev/null \
+            | jq '.[0]')
+
+          UPDATED_CONFIG=$(echo "$CURRENT_CONFIG" | jq -c \
+            --arg vlan "$VLAN_NAME" \
+            --arg ipam "$IPAM" \
+            '{
+              kernel: .kernel,
+              run_level: .run_level,
+              virt_mode: .virt_mode,
+              root_device: .root_device,
+              helpers: .helpers,
+              devices: .devices,
+              memory_limit: .memory_limit,
+              comments: (.comments // ""),
+              interfaces: (
+                ([.interfaces[] | select(.purpose != "vlan" or .label != $vlan)
+                  | del(.id, .active, .vpc_id)]
+                  as $kept |
+                ((if ($kept | map(select(.purpose == "public")) | length) == 0
+                  then [{"purpose":"public"}] else [] end)
+                + $kept + [{"purpose":"vlan","label":$vlan,"ipam_address":$ipam}]))
+              )
+            }')
+
+          linode-cli linodes config-update "$LINODE_ID" "$CONFIG_ID" \
+            --raw-body "$UPDATED_CONFIG" \
+            >/dev/null
+          echo "INFO: config updated for node $NODE_NAME"
+          label_node "$NODE_NAME" "lke-vlan-controller-status" "vlan_ip_assigned"
+
+          VLAN_IP_LABEL=$(echo "$IPAM" | tr '/' '_')
+          NEEDS_REBOOT="$NEEDS_REBOOT $NODE_NAME:$LINODE_ID:$VLAN_IP_LABEL"
+        done
+
+        rm -f "$USED_IPS_FILE"
+      fi
+
+      # ── 4. Reboot nodes — MY_NODE always last ─────────────────────────────
+      if [ -z "$NEEDS_REBOOT" ]; then
+        sleep 60
+        continue
+      fi
+
+      if [ "$REBOOT_ENABLED" != "true" ]; then
+        echo "INFO: reboot disabled -- nodes pending reboot:$NEEDS_REBOOT"
+        sleep 60
+        continue
+      fi
+
+      if ! cluster_all_ready; then
+        echo "WARN: cluster has NotReady nodes -- deferring reboots to next iteration"
+        sleep 60
+        continue
+      fi
+
+      MY_NODE_ENTRY=""
+
+      for ENTRY in $NEEDS_REBOOT; do
+        NODE_NAME=$(echo "$ENTRY"     | cut -d: -f1)
+        LINODE_ID=$(echo "$ENTRY"     | cut -d: -f2)
+        VLAN_IP_LABEL=$(echo "$ENTRY" | cut -d: -f3)
+
+        # Defer MY_NODE to after all other reboots so the replacement pod
+        # always finds at least one uncordoned, Ready node to land on.
+        if [ "$NODE_NAME" = "$MY_NODE_NAME" ]; then
+          MY_NODE_ENTRY="$ENTRY"
+          continue
+        fi
+
+        echo "INFO: rebooting node $NODE_NAME (Linode $LINODE_ID)"
+        label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
+        cordon_node "$NODE_NAME"
+        linode-cli linodes reboot "$LINODE_ID" >/dev/null
+        wait_node_not_ready "$NODE_NAME"
+        wait_node_ready "$NODE_NAME"
+        # vlan-ip is set only after the node is back to Ready — this is the
+        # stateless completion marker.  A crash before this line is safe: the
+        # next iteration classifies the node as needs_reboot and reboots again.
+        label_node "$NODE_NAME" "vlan-ip" "$VLAN_IP_LABEL"
+        label_node "$NODE_NAME" "lke-vlan-controller-status" "completed"
+        uncordon_node "$NODE_NAME"
+        echo "INFO: node $NODE_NAME rebooted and active"
+      done
+
+      # All other nodes are Ready and uncordoned. Cordon MY_NODE and migrate:
+      # the replacement pod has N-1 schedulable nodes available.
+      if [ -n "$MY_NODE_ENTRY" ]; then
+        NODE_NAME=$(echo "$MY_NODE_ENTRY"     | cut -d: -f1)
+        LINODE_ID=$(echo "$MY_NODE_ENTRY"     | cut -d: -f2)
+
+        echo "INFO: all other nodes done -- cordoning $NODE_NAME and migrating self"
+        label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
+        cordon_node "$NODE_NAME"
+        evict_self
+        # exit 0 in evict_self — never reached in this pod.
+        # The replacement pod sees: VLAN in config, no vlan-ip label -> needs_reboot.
+        # MY_NODE_NAME != $NODE_NAME -> goes through the normal reboot path.
+      fi
+
+      sleep 60
+    done

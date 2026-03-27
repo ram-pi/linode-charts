@@ -1,0 +1,18 @@
+apiVersion: v2
+name: lke-vlan-controller
+description: >
+  Assigns VLAN interfaces to LKE nodes and manages rolling reboots.
+  A controller deployment serializes IP assignment and node reboots
+  to prevent collisions and disruption.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - linode
+  - vlan
+  - lke
+  - networking
+sources:
+  - https://github.com/ram-pi/linode-charts
+maintainers:
+  - name: ram-pi

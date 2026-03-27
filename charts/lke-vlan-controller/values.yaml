@@ -1,0 +1,60 @@
+# -- VLAN configuration.
+vlan:
+  # -- REQUIRED. VLAN label as it appears in the Linode account (e.g. "my-private-vlan").
+  name: ""
+  # -- REQUIRED. CIDR block to allocate addresses from (e.g. "192.168.128.0/17").
+  cidr: ""
+
+# -- Linode API token with Linodes Read/Write scope.
+# Mutually exclusive with existingSecret — set exactly one.
+linodeToken: ""
+
+# -- Name of a pre-existing Kubernetes Secret whose key holds the Linode API token.
+# When set, linodeToken is ignored and no Secret resource is created.
+existingSecret: ""
+
+# -- Key within the Secret that holds the token value.
+secretKey: "token"
+
+namespace:
+  # -- Create the namespace as part of this Helm release.
+  # Set to false if you manage namespaces externally (e.g. via GitOps).
+  create: true
+
+deployment:
+  image:
+    repository: alpine
+    tag: "3.21.3"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  # -- Node selector applied to the controller pod.
+  nodeSelector: {}
+  # -- Tolerations for the controller pod.
+  tolerations: []
+
+reboot:
+  # -- Whether to reboot nodes after attaching the VLAN interface.
+  enabled: true
+  # -- Seconds to wait for a node to become Ready after reboot before timing out.
+  waitTimeoutSeconds: 600
+
+serviceAccount:
+  # -- If true, create a ServiceAccount. Set to false to bring your own.
+  create: true
+  # -- Name override. Defaults to the chart fullname.
+  name: ""
+  annotations: {}
+
+# -- Labels added to all resources.
+commonLabels: {}
+# -- Annotations added to all resources.
+commonAnnotations: {}
+
+nameOverride: ""
+fullnameOverride: ""

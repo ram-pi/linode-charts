@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lke-vlan-controller.fullname" . }}
+  labels:
+    {{- include "lke-vlan-controller.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Single replica ensures the reconciliation loop is serialised:
+  # only one goroutine assigns IPs and reboots nodes at a time,
+  # preventing IP collision races without distributed locking.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lke-vlan-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-vlan-controller.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lke-vlan-controller.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "lke-vlan-controller.fullname" . }}-scripts
+            defaultMode: 0555
+      containers:
+        - name: controller
+          image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+          imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          # Install runtime dependencies then run the controller loop.
+          # linode-cli is installed in a Python virtual environment (Alpine 3.21+ blocks system pip).
+          # linode-cli is configured via LINODE_CLI_TOKEN (no config file needed).
+          command: ["/bin/sh", "-c"]
+          args:
+            - "apk add --no-cache python3 py3-pip curl jq nmap >/dev/null 2>&1 && python3 -m venv /opt/venv && . /opt/venv/bin/activate && pip install linode-cli >/dev/null 2>&1 && /scripts/register.sh"
+          env:
+            - name: LINODE_CLI_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lke-vlan-controller.secretName" . }}
+                  key: {{ .Values.secretKey }}
+            - name: VLAN_NAME
+              value: {{ .Values.vlan.name | quote }}
+            - name: VLAN_CIDR
+              value: {{ .Values.vlan.cidr | quote }}
+            - name: REBOOT_ENABLED
+              value: {{ .Values.reboot.enabled | quote }}
+            - name: REBOOT_TIMEOUT
+              value: {{ .Values.reboot.waitTimeoutSeconds | quote }}
+            - name: MY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MY_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}
