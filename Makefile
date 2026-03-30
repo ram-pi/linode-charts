@@ -147,9 +147,56 @@ nat-gateway-setup:
 	@echo "══════════════════════════════════════════════════════════════════════════"
 	@echo ""
 
+## create-vpc-vm: Create a VM in the VPC subnet used by CLUSTER_LABEL (LKE Enterprise)
+##   The VM uses a VPC-only interface with nat_1_1=any (same pattern as LKE Enterprise nodes).
+##   Outputs the VPC IP (use as ZoneEgress address) and the 1:1 NAT public IP (SSH + egress).
+##   Override defaults: VM_LABEL, VM_TYPE, VM_IMAGE, REGION, CLUSTER_LABEL
+##   Example: make create-vpc-vm CLUSTER_LABEL=my-enterprise-cluster VM_LABEL=kuma-egress
+.PHONY: create-vpc-vm
+create-vpc-vm:
+	$(eval CLUSTER_ID := $(shell LINODE_CLI_API_VERSION=v4beta linode-cli lke clusters-list --json | \
+		jq -r '.[] | select(.label=="$(CLUSTER_LABEL)") | .id'))
+	@test -n "$(CLUSTER_ID)" || (echo "Cluster '$(CLUSTER_LABEL)' not found"; exit 1)
+	$(eval POOL_ID := $(shell LINODE_CLI_API_VERSION=v4beta linode-cli lke pools-list $(CLUSTER_ID) --json | \
+		jq -r '.[0].id'))
+	$(eval NODE_LINODE_ID := $(shell LINODE_CLI_API_VERSION=v4beta linode-cli lke pool-view $(CLUSTER_ID) $(POOL_ID) --json | \
+		jq -r '[.[0].nodes[] | select(.status=="ready")][0].instance_id'))
+	$(eval SUBNET_ID := $(shell linode-cli linodes configs-list $(NODE_LINODE_ID) --json | \
+		jq -r '.[0].interfaces[] | select(.purpose=="vpc") | .subnet_id'))
+	@test -n "$(SUBNET_ID)" || (echo "Could not find VPC subnet for cluster '$(CLUSTER_LABEL)'. Is it an LKE Enterprise cluster?"; exit 1)
+	@echo "Resolved: cluster=$(CLUSTER_LABEL) node=$(NODE_LINODE_ID) subnet=$(SUBNET_ID)"
+	@ROOT_PASS="$$(openssl rand -base64 24)"; \
+	RESULT=$$(linode-cli linodes create \
+		--label "$(VM_LABEL)" \
+		--region "$(REGION)" \
+		--type "$(VM_TYPE)" \
+		--image "$(VM_IMAGE)" \
+		--interfaces '[{"purpose":"vpc","subnet_id":$(SUBNET_ID),"ipv4":{"nat_1_1":"any"}}]' \
+		--root_pass "$$ROOT_PASS" \
+		--json); \
+	LINODE_ID=$$(echo "$$RESULT" | jq -r '.[0].id'); \
+	echo "$$RESULT" | jq -r '.[0] | "Created: \(.label) (id=\(.id))"'; \
+	CONFIGS=$$(linode-cli linodes configs-list $$LINODE_ID --json 2>/dev/null); \
+	VPC_IP=$$(echo "$$CONFIGS" | jq -r '.[0].interfaces[] | select(.purpose=="vpc") | .ipv4.address // empty'); \
+	NAT_IP=$$(echo "$$CONFIGS" | jq -r '.[0].interfaces[] | select(.purpose=="vpc") | .ipv4.nat_1_1 // empty'); \
+	echo ""; \
+	echo "VPC IP  (ZoneEgress networking.address): $${VPC_IP:-"run: linode-cli linodes configs-list $$LINODE_ID --json"}"; \
+	echo "NAT IP  (SSH + egress public IP):         $${NAT_IP:-"see Cloud Manager or linode-cli linodes configs-list $$LINODE_ID --json"}"; \
+	echo "SSH:    ssh root@$${NAT_IP:-<NAT_IP>}"; \
+	echo "Pass:   $$ROOT_PASS"
+
 ## delete-vlan-vm: Delete the VLAN test VM
 .PHONY: delete-vlan-vm
 delete-vlan-vm:
+	$(eval VM_ID := $(shell linode-cli linodes list --json | \
+		jq -r '.[] | select(.label=="$(VM_LABEL)") | .id'))
+	@test -n "$(VM_ID)" || (echo "VM '$(VM_LABEL)' not found"; exit 1)
+	linode-cli linodes delete $(VM_ID)
+	@echo "VM $(VM_LABEL) (id=$(VM_ID)) deleted."
+
+## delete-vpc-vm: Delete a VPC VM by label (e.g. make delete-vpc-vm VM_LABEL=kuma-egress)
+.PHONY: delete-vpc-vm
+delete-vpc-vm:
 	$(eval VM_ID := $(shell linode-cli linodes list --json | \
 		jq -r '.[] | select(.label=="$(VM_LABEL)") | .id'))
 	@test -n "$(VM_ID)" || (echo "VM '$(VM_LABEL)' not found"; exit 1)
