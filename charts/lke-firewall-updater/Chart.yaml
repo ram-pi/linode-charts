@@ -1,16 +1,22 @@
 apiVersion: v2
 name: lke-firewall-updater
 description: >
-  Keeps a Linode Cloud Firewall rule in sync with LKE node public IPs.
-  A DaemonSet registers each node's IP on boot; a CronJob removes stale IPs.
+  Keeps cloud firewall rules in sync with Kubernetes node public IPs.
+  Supports Linode Cloud Firewalls, AWS Security Groups, and GCP VPC Firewall Rules.
+  An event-driven single-writer controller (leader election via Kubernetes Lease)
+  watches node changes and reconciles all enabled providers with zero race conditions.
 type: application
-version: 0.1.0
-appVersion: "1.0.0"
+version: 0.2.0
+appVersion: "2.0.0"
 keywords:
   - linode
+  - aws
+  - gcp
   - firewall
+  - security-group
   - lke
   - networking
+  - multi-cloud
 sources:
   - https://github.com/ram-pi/linode-charts
 maintainers:

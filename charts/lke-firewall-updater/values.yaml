@@ -1,70 +1,24 @@
-# -- Linode Cloud Firewalls to manage.
-firewall:
-  # -- REQUIRED. List of Linode Cloud Firewall IDs (integers).
-  # The node IP will be registered in every firewall in this list.
-  ids: []
-  # -- Fallback label for the managed inbound rule entry.
-  # When the LKE cluster ID can be auto-detected from node labels, the rule is
-  # named "lke-nodes-{cluster_id}" instead. This value is only used when
-  # auto-detection fails.
-  ruleName: "lke-nodes"
-  # -- Protocol for the managed rule.
-  protocol: "TCP"
-  # -- Ports expression in Linode format (e.g. "22", "1-65535", "80,443").
-  ports: "1-65535"
-  # -- Rule action: ACCEPT or DROP.
-  action: "ACCEPT"
+# ── Node filtering ────────────────────────────────────────────────────────────
+nodes:
+  # -- Kubernetes label selector. Only nodes matching this selector have their
+  # ExternalIPs added to firewall rules. Empty string includes all nodes.
+  # Example: "node-role.kubernetes.io/worker=true" or "node-type=worker"
+  labelSelector: ""
 
-# -- Linode API token with Firewalls Read/Write scope.
-# Mutually exclusive with existingSecret — set exactly one.
-linodeToken: ""
-
-# -- Name of a pre-existing Kubernetes Secret whose key holds the Linode API token.
-# When set, linodeToken is ignored and no Secret resource is created.
-existingSecret: ""
-
-# -- Key within the Secret that holds the token value.
-secretKey: "token"
-
-namespace:
-  # -- Create the namespace as part of this Helm release.
-  # Set to false if you manage namespaces externally (e.g. via GitOps).
-  create: true
-
-daemonset:
-  # -- Enable the node-registration DaemonSet.
-  enabled: true
+# ── Controller Deployment ─────────────────────────────────────────────────────
+controller:
+  # -- Number of replicas. With replicas > 1, leader election via Kubernetes
+  # Lease ensures only one pod runs the reconciliation loop at a time; the
+  # standby pod takes over automatically if the leader crashes.
+  replicas: 2
+  # -- Seconds to wait after a watch event before reconciling.
+  # Absorbs burst registrations (e.g. 5 nodes booting at once → 1 reconcile).
+  debounceSeconds: 3
+  # -- Full reconcile interval in seconds (safety net for missed watch events).
+  reconcileInterval: 300
   image:
     repository: alpine
-    tag: "3.21.3"
-    pullPolicy: IfNotPresent
-  resources:
-    requests:
-      cpu: "10m"
-      memory: "32Mi"
-    limits:
-      cpu: "100m"
-      memory: "64Mi"
-  # -- Extra labels added to DaemonSet pods.
-  podLabels: {}
-  # -- Node selector applied to DaemonSet pods.
-  nodeSelector: {}
-  # -- Tolerations for the DaemonSet.
-  tolerations: []
-
-cronjob:
-  # -- Enable the periodic cleanup CronJob.
-  enabled: true
-  # -- Cron schedule. Default: every 15 minutes.
-  schedule: "*/15 * * * *"
-  # -- Forbid prevents overlapping cleanup runs (safe for read-modify-write operations).
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 1
-  # -- Deadline in seconds for a job to start after missing its scheduled time.
-  startingDeadlineSeconds: 120
-  image:
-    repository: alpine
+    # -- For provider: gcp, override to google/cloud-sdk:alpine (gcloud pre-installed).
     tag: "3.21.3"
     pullPolicy: IfNotPresent
   resources:
@@ -73,15 +27,93 @@ cronjob:
       memory: "64Mi"
     limits:
       cpu: "200m"
-      memory: "128Mi"
-  # -- Node selector for CronJob pods.
+      memory: "256Mi"
+  # -- Extra labels added to controller pods.
+  podLabels: {}
+  # -- Node selector for controller pods.
   nodeSelector: {}
+  # -- Tolerations for controller pods.
   tolerations: []
 
-serviceAccount:
-  # -- If true, create a ServiceAccount. Set to false to bring your own.
+# ── Leader election ───────────────────────────────────────────────────────────
+leaderElection:
+  leaseDurationSeconds: 30
+  renewIntervalSeconds: 10
+
+# ── Providers ─────────────────────────────────────────────────────────────────
+# Enable one or more providers. The controller reconciles all enabled providers
+# on every loop iteration using the same computed node IP list.
+providers:
+
+  # ── Linode Cloud Firewalls ──────────────────────────────────────────────────
+  linode:
+    # -- Set to true to manage Linode Cloud Firewall rules.
+    # Defaults to true for backward compatibility with v0.1.x.
+    enabled: true
+    # -- Linode API token with Firewalls Read/Write scope.
+    # Mutually exclusive with existingSecret — set exactly one.
+    token: ""
+    # -- Name of a pre-existing Kubernetes Secret containing the Linode token.
+    existingSecret: ""
+    # -- Key within the Secret that holds the token value.
+    secretKey: "token"
+    firewall:
+      # -- REQUIRED. List of Linode Cloud Firewall IDs (integers).
+      ids: []
+      # -- Fallback label for the managed inbound rule entry.
+      # Auto-detected as "lke-nodes-{cluster_id}" when possible.
+      ruleName: "lke-nodes"
+      # -- Protocol for the managed rule.
+      protocol: "TCP"
+      # -- Ports expression in Linode format (e.g. "22", "1-65535", "80,443").
+      ports: "1-65535"
+      # -- Rule action: ACCEPT or DROP.
+      action: "ACCEPT"
+
+  # ── AWS Security Groups ─────────────────────────────────────────────────────
+  aws:
+    # -- Set to true to manage AWS Security Group ingress rules.
+    enabled: false
+    # -- AWS region (e.g. "us-east-1").
+    region: ""
+    # -- Name of a pre-existing Secret containing AWS_ACCESS_KEY_ID and
+    # AWS_SECRET_ACCESS_KEY keys.
+    existingSecret: ""
+    # -- Inline credentials (chart creates a Secret). Use existingSecret in production.
+    accessKeyId: ""
+    secretAccessKey: ""
+    # -- List of Security Group IDs to manage.
+    securityGroupIds: []
+    # -- Protocol for managed ingress rules. AWS format: "tcp", "udp", "-1" (all).
+    protocol: "tcp"
+    # -- Ingress port range.
+    fromPort: 0
+    toPort: 65535
+
+  # ── GCP VPC Firewall Rules ──────────────────────────────────────────────────
+  gcp:
+    # -- Set to true to manage GCP VPC Firewall Rules.
+    enabled: false
+    # -- GCP project ID.
+    projectId: ""
+    # -- Name of the VPC firewall rule to update.
+    firewallRuleName: ""
+    # -- Name of a pre-existing Secret whose "key.json" key contains a service
+    # account JSON key with "compute.firewalls.update" permission.
+    existingSecret: ""
+    # -- Inline service account JSON (chart creates a Secret).
+    # Use existingSecret in production.
+    serviceAccountJson: ""
+
+# ── Namespace ─────────────────────────────────────────────────────────────────
+namespace:
+  # -- Create the namespace as part of this Helm release.
   create: true
-  # -- Name override. Defaults to the chart fullname.
+
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+serviceAccount:
+  # -- If true, create a ServiceAccount.
+  create: true
   name: ""
   annotations: {}
 
@@ -92,3 +124,22 @@ commonAnnotations: {}
 
 nameOverride: ""
 fullnameOverride: ""
+
+# ── DEPRECATED — v0.1.x keys ──────────────────────────────────────────────────
+# These keys are still accepted in v0.2.0 for backward compatibility and will
+# be removed in v0.3.0. Migrate to providers.linode.* equivalents.
+#
+# linodeToken → providers.linode.token
+# existingSecret → providers.linode.existingSecret
+# secretKey → providers.linode.secretKey
+# firewall.* → providers.linode.firewall.*
+# daemonset.* and cronjob.* are removed — use controller.* instead.
+linodeToken: ""
+existingSecret: ""
+secretKey: "token"
+firewall:
+  ids: []
+  ruleName: "lke-nodes"
+  protocol: "TCP"
+  ports: "1-65535"
+  action: "ACCEPT"

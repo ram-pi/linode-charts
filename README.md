@@ -6,7 +6,7 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 
 | Chart | Version | Description |
 |---|---|---|
-| [lke-firewall-updater](charts/lke-firewall-updater/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-firewall-updater/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-firewall-updater) | Syncs LKE node public IPs into a Linode Cloud Firewall rule — DaemonSet registers IPs on boot, CronJob removes stale ones |
+| [lke-firewall-updater](charts/lke-firewall-updater/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-firewall-updater/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-firewall-updater) | Keeps cloud firewall rules in sync with Kubernetes node public IPs — supports Linode Cloud Firewalls, AWS Security Groups, and GCP VPC Firewall Rules simultaneously; event-driven single-writer controller with leader election eliminates concurrent-write race conditions |
 | [lke-vlan-controller](charts/lke-vlan-controller/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller) | Attaches a VLAN interface to every node in a standard LKE cluster with rolling reboots and IPAM |
 | [lke-vlan-controller-enterprise](charts/lke-vlan-controller-enterprise/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller-enterprise/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller-enterprise) | Variant of lke-vlan-controller for LKE Enterprise clusters (VPC-aware: shuts down nodes before config update, disables Linode Network Helper) |
 | [lke-route-injector](charts/lke-route-injector/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-route-injector/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-route-injector) | Injects static IP routes on targeted LKE nodes via a DaemonSet — routes survive reboots and are re-applied on a configurable interval |
@@ -16,12 +16,26 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 Install the published chart directly from GitHub Container Registry:
 
 ```bash
+# Linode Cloud Firewalls only
 helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater \
-	--version 0.1.0 \
+	--version 0.2.0 \
 	--namespace lke-firewall-updater \
 	--create-namespace \
-	--set-json 'firewall.ids=[12345]' \
-	--set linodeToken=<YOUR_LINODE_TOKEN>
+	--set-json 'providers.linode.firewall.ids=[12345]' \
+	--set providers.linode.token=<YOUR_LINODE_TOKEN>
+
+# Linode + AWS simultaneously, only nodes labelled node-type=worker
+helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater \
+	--version 0.2.0 \
+	--namespace lke-firewall-updater \
+	--create-namespace \
+	--set nodes.labelSelector=node-type=worker \
+	--set-json 'providers.linode.firewall.ids=[12345]' \
+	--set providers.linode.token=<YOUR_LINODE_TOKEN> \
+	--set providers.aws.enabled=true \
+	--set providers.aws.region=us-east-1 \
+	--set providers.aws.existingSecret=aws-credentials \
+	--set-json 'providers.aws.securityGroupIds=["sg-abc123"]'
 ```
 
 For chart-specific values and more installation options, see [charts/lke-firewall-updater/README.md](charts/lke-firewall-updater/README.md).
@@ -131,6 +145,9 @@ make create-vlan-vm VLAN_LABEL=private-lke VLAN_IP=172.20.200.101/24
 
 # Print commands to configure it as a NAT gateway
 make nat-gateway-setup VM_LABEL=vlan-test-vm
+
+# Add a node pool with a custom label (useful for testing lke-firewall-updater label selectors)
+make add-node-pool CLUSTER_LABEL=linode-charts-test POOL_LABEL_KEY=node-type POOL_LABEL_VALUE=worker
 
 # Add a node pool labelled lke-vlan-exclude=true (skipped by lke-vlan-controller)
 make add-excluded-pool CLUSTER_LABEL=linode-charts-test

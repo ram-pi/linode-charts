@@ -1,0 +1,154 @@
+{{- if .Values.providers.gcp.enabled }}
+{{- if not (contains "google/cloud-sdk" .Values.controller.image.repository) }}
+{{- fail "GCP provider requires google/cloud-sdk:alpine image. Update controller.image.repository in values.yaml." }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lke-firewall-updater.fullname" . }}
+  labels:
+    {{- include "lke-firewall-updater.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Leader election via a Kubernetes Lease ensures only one pod runs the
+  # reconciliation loop regardless of replica count. Extra replicas wait on
+  # standby and take over automatically if the leader crashes.
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      {{- include "lke-firewall-updater.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-firewall-updater.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+        {{- with .Values.controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Force pod restart whenever the controller script changes.
+        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lke-firewall-updater.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "lke-firewall-updater.fullname" . }}-scripts
+            defaultMode: 0555
+        {{- if .Values.providers.gcp.enabled }}
+        - name: gcp-credentials
+          secret:
+            secretName: {{ include "lke-firewall-updater.gcpSecretName" . }}
+        {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          # Install runtime deps then launch the event-driven controller loop.
+          # Linode + AWS: stock Alpine with curl, jq, aws-cli (all in apk).
+          # GCP: override controller.image to google/cloud-sdk:alpine (gcloud pre-installed).
+          command: ["/bin/sh", "-c"]
+          args:
+            - {{ include "lke-firewall-updater.containerArgs" . | quote }}
+          env:
+            # ── Universal ────────────────────────────────────────────────────
+            - name: MY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MY_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEASE_NAME
+              value: {{ printf "%s-leader" (include "lke-firewall-updater.fullname" .) | quote }}
+            - name: LEASE_DURATION_SECONDS
+              value: {{ .Values.leaderElection.leaseDurationSeconds | quote }}
+            - name: RENEW_INTERVAL_SECONDS
+              value: {{ .Values.leaderElection.renewIntervalSeconds | quote }}
+            - name: LABEL_SELECTOR
+              value: {{ .Values.nodes.labelSelector | quote }}
+            - name: DEBOUNCE_SECONDS
+              value: {{ .Values.controller.debounceSeconds | quote }}
+            - name: RECONCILE_INTERVAL
+              value: {{ .Values.controller.reconcileInterval | quote }}
+            # ── Linode ───────────────────────────────────────────────────────
+            - name: LINODE_ENABLED
+              value: {{ .Values.providers.linode.enabled | quote }}
+            {{- if .Values.providers.linode.enabled }}
+            - name: LINODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lke-firewall-updater.linodeSecretName" . }}
+                  key: {{ include "lke-firewall-updater.resolvedLinodeSecretKey" . }}
+            - name: LINODE_FIREWALL_IDS
+              value: {{ include "lke-firewall-updater.resolvedFirewallIds" . | quote }}
+            - name: LINODE_RULE_NAME
+              value: {{ include "lke-firewall-updater.resolvedRuleName" . | quote }}
+            - name: LINODE_RULE_PROTOCOL
+              value: {{ include "lke-firewall-updater.resolvedProtocol" . | quote }}
+            - name: LINODE_RULE_PORTS
+              value: {{ include "lke-firewall-updater.resolvedPorts" . | quote }}
+            - name: LINODE_RULE_ACTION
+              value: {{ include "lke-firewall-updater.resolvedAction" . | quote }}
+            {{- end }}
+            # ── AWS ──────────────────────────────────────────────────────────
+            - name: AWS_ENABLED
+              value: {{ .Values.providers.aws.enabled | quote }}
+            {{- if .Values.providers.aws.enabled }}
+            - name: AWS_REGION
+              value: {{ .Values.providers.aws.region | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lke-firewall-updater.awsSecretName" . }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lke-firewall-updater.awsSecretName" . }}
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_SECURITY_GROUP_IDS
+              value: {{ join " " .Values.providers.aws.securityGroupIds | quote }}
+            - name: AWS_PROTOCOL
+              value: {{ .Values.providers.aws.protocol | quote }}
+            - name: AWS_FROM_PORT
+              value: {{ .Values.providers.aws.fromPort | quote }}
+            - name: AWS_TO_PORT
+              value: {{ .Values.providers.aws.toPort | quote }}
+            {{- end }}
+            # ── GCP ──────────────────────────────────────────────────────────
+            - name: GCP_ENABLED
+              value: {{ .Values.providers.gcp.enabled | quote }}
+            {{- if .Values.providers.gcp.enabled }}
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.providers.gcp.projectId | quote }}
+            - name: GCP_FIREWALL_RULE_NAME
+              value: {{ .Values.providers.gcp.firewallRuleName | quote }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /var/secrets/gcp/key.json
+            {{- end }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            {{- if .Values.providers.gcp.enabled }}
+            - name: gcp-credentials
+              mountPath: /var/secrets/gcp
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}

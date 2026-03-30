@@ -9,295 +9,590 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 data:
-  register.sh: |
+  controller.sh: |
     #!/bin/sh
-    # register.sh — Runs on each node at pod start.
-    # Adds this node's public IP into the managed inbound rule across all configured firewalls,
-    # then sleeps forever to keep the DaemonSet pod alive.
-    set -e
+    # controller.sh — Event-driven firewall reconciliation controller.
+    #
+    # Architecture:
+    #   - Acquires a Kubernetes Lease (leader election) so only one replica runs.
+    #   - Opens a watch stream on /api/v1/nodes to detect node changes in real-time.
+    #   - Debounces burst events (e.g. 5 nodes booting at once → 1 reconcile).
+    #   - On each reconcile: collects all matching node IPs, updates all enabled
+    #     cloud providers atomically (single writer — no concurrent write race).
+    #   - Runs a periodic full reconcile as a safety net for missed watch events.
+    set -eu
 
-    # ── Validate required env vars ────────────────────────────────────────────
-    : "${LINODE_TOKEN:?LINODE_TOKEN is required}"
-    : "${FIREWALL_IDS:?FIREWALL_IDS is required}"
-    : "${RULE_NAME:?RULE_NAME is required}"
-    : "${RULE_PROTOCOL:?RULE_PROTOCOL is required}"
-    : "${RULE_PORTS:?RULE_PORTS is required}"
-    : "${RULE_ACTION:?RULE_ACTION is required}"
-    : "${NODE_NAME:?NODE_NAME is required}"
+    # ── Validate universal env vars ───────────────────────────────────────────
+    : "${MY_POD_NAME:?MY_POD_NAME is required}"
+    : "${MY_NAMESPACE:?MY_NAMESPACE is required}"
+    : "${LEASE_NAME:?LEASE_NAME is required}"
+    : "${LEASE_DURATION_SECONDS:?LEASE_DURATION_SECONDS is required}"
+    : "${RENEW_INTERVAL_SECONDS:?RENEW_INTERVAL_SECONDS is required}"
+    : "${DEBOUNCE_SECONDS:?DEBOUNCE_SECONDS is required}"
+    : "${RECONCILE_INTERVAL:?RECONCILE_INTERVAL is required}"
 
-    LINODE_API="https://api.linode.com/v4"
-    K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    K8S_TOKEN_FILE=/var/run/secrets/kubernetes.io/serviceaccount/token
     K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-
-    # ── Query this node from the Kubernetes API ───────────────────────────────
-    echo "INFO: querying node $NODE_NAME from Kubernetes API"
-    HTTP_CODE=$(curl -s -o /tmp/node.json -w "%{http_code}" \
-      -H "Authorization: Bearer $K8S_TOKEN" \
-      --cacert "$K8S_CA" \
-      "https://kubernetes.default.svc/api/v1/nodes/$NODE_NAME")
-    if [ "$HTTP_CODE" != "200" ]; then
-      echo "ERROR: Kubernetes API returned HTTP $HTTP_CODE querying node $NODE_NAME"
-      cat /tmp/node.json
-      exit 1
-    fi
-
-    MY_IP=$(jq -r '.status.addresses[] | select(.type=="ExternalIP") | .address' /tmp/node.json | head -1)
-    if [ -z "$MY_IP" ]; then
-      echo "ERROR: no ExternalIP found on node $NODE_NAME"
-      echo "       node addresses: $(jq -c '.status.addresses' /tmp/node.json)"
-      exit 1
-    fi
-    echo "INFO: node public IP is $MY_IP"
-    MY_CIDR="${MY_IP}/32"
-
-    # ── Determine effective rule name ─────────────────────────────────────────
-    # 1. Try the lke.k8s.io/cluster-id label (set by some LKE versions)
-    CLUSTER_ID=$(jq -r '.metadata.labels["lke.k8s.io/cluster-id"] // empty' /tmp/node.json)
-    # 2. Fall back to parsing the node name (LKE format: lke{cluster_id}-{pool_id}-{node_id})
-    if [ -z "$CLUSTER_ID" ]; then
-      CLUSTER_ID=$(echo "$NODE_NAME" | sed -n 's/^lke\([0-9]*\)-.*/\1/p')
-    fi
-    if [ -n "$CLUSTER_ID" ]; then
-      EFFECTIVE_RULE_NAME="lke-nodes-${CLUSTER_ID}"
-      echo "INFO: LKE cluster ID detected: $CLUSTER_ID — rule name is '$EFFECTIVE_RULE_NAME'"
-    else
-      EFFECTIVE_RULE_NAME="$RULE_NAME"
-      echo "INFO: cluster ID not found in label or node name — using fallback rule name '$EFFECTIVE_RULE_NAME'"
-    fi
-
-    # ── Register in each firewall ─────────────────────────────────────────────
-    OVERALL_OK=1
-    for FIREWALL_ID in $FIREWALL_IDS; do
-      echo "INFO: [fw=$FIREWALL_ID] registering $MY_CIDR"
-      FW_OK=0
-      MAX_RETRIES=10
-      attempt=1
-
-      while [ "$attempt" -le "$MAX_RETRIES" ]; do
-        if [ "$attempt" -gt 1 ]; then
-          JITTER=$(awk 'BEGIN{srand(); print int(rand()*10)+1}')
-          echo "INFO: [fw=$FIREWALL_ID] retry $attempt/$MAX_RETRIES, waiting ${JITTER}s"
-          sleep "$JITTER"
-        fi
-
-        # GET current rules
-        HTTP_CODE=$(curl -s -o /tmp/rules.json -w "%{http_code}" \
-          -H "Authorization: Bearer $LINODE_TOKEN" \
-          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
-        if [ "$HTTP_CODE" != "200" ]; then
-          echo "WARN: [fw=$FIREWALL_ID] GET rules returned HTTP $HTTP_CODE: $(cat /tmp/rules.json)"
-          attempt=$((attempt + 1))
-          continue
-        fi
-
-        # Locate the managed rule by label
-        EXISTING=$(jq -r --arg l "$EFFECTIVE_RULE_NAME" \
-          '.inbound[] | select(.label==$l) | .label // empty' /tmp/rules.json)
-
-        if [ -z "$EXISTING" ]; then
-          RULE_COUNT=$(jq '.inbound | length' /tmp/rules.json)
-          if [ "$RULE_COUNT" -ge 25 ]; then
-            echo "ERROR: [fw=$FIREWALL_ID] firewall has $RULE_COUNT inbound rules (Linode max is 25)"
-            echo "       Cannot add rule '$EFFECTIVE_RULE_NAME'. Remove unused rules first."
-            OVERALL_OK=0
-            break
-          fi
-          echo "INFO: [fw=$FIREWALL_ID] rule '$EFFECTIVE_RULE_NAME' not found — creating it"
-          NEW_RULE=$(jq -n \
-            --arg label  "$EFFECTIVE_RULE_NAME" \
-            --arg action "$RULE_ACTION" \
-            --arg proto  "$RULE_PROTOCOL" \
-            --arg ports  "$RULE_PORTS" \
-            --arg cidr   "$MY_CIDR" \
-            '{label:$label,action:$action,protocol:$proto,ports:$ports,
-              addresses:{ipv4:[$cidr]}}')
-          UPDATED=$(jq --argjson r "$NEW_RULE" '.inbound += [$r]' /tmp/rules.json)
-        else
-          echo "INFO: [fw=$FIREWALL_ID] merging $MY_CIDR into rule '$EFFECTIVE_RULE_NAME'"
-          UPDATED=$(jq \
-            --arg l "$EFFECTIVE_RULE_NAME" --arg cidr "$MY_CIDR" \
-            '(.inbound[] | select(.label==$l) | .addresses.ipv4) |= (. + [$cidr] | unique)' \
-            /tmp/rules.json)
-        fi
-
-        HTTP_CODE=$(curl -s -o /tmp/put.json -w "%{http_code}" \
-          -X PUT \
-          -H "Authorization: Bearer $LINODE_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "$UPDATED" \
-          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
-
-        if [ "$HTTP_CODE" = "200" ]; then
-          echo "INFO: [fw=$FIREWALL_ID] registered $MY_IP successfully"
-          FW_OK=1
-          break
-        fi
-
-        echo "WARN: [fw=$FIREWALL_ID] PUT returned HTTP $HTTP_CODE: $(cat /tmp/put.json)"
-        case "$HTTP_CODE" in
-          400|401|403)
-            echo "ERROR: [fw=$FIREWALL_ID] non-retryable error"
-            OVERALL_OK=0
-            break
-            ;;
-        esac
-        attempt=$((attempt + 1))
-      done
-
-      if [ "$FW_OK" = "0" ] && [ "$OVERALL_OK" = "1" ]; then
-        echo "ERROR: [fw=$FIREWALL_ID] exhausted $MAX_RETRIES retries"
-        OVERALL_OK=0
-      fi
-    done
-
-    if [ "$OVERALL_OK" = "0" ]; then
-      echo "ERROR: one or more firewalls failed to update"
-      exit 1
-    fi
-
-    echo "INFO: all firewalls updated — sleeping"
-    exec sleep infinity
-
-  cleanup.sh: |
-    #!/bin/sh
-    # cleanup.sh — Runs on a schedule via CronJob.
-    # Removes IPs from managed firewall rules that no longer belong to any cluster node.
-    set -e
-
-    # ── Validate required env vars ────────────────────────────────────────────
-    : "${LINODE_TOKEN:?LINODE_TOKEN is required}"
-    : "${FIREWALL_IDS:?FIREWALL_IDS is required}"
-    : "${RULE_NAME:?RULE_NAME is required}"
-
+    K8S_API="https://kubernetes.default.svc"
     LINODE_API="https://api.linode.com/v4"
 
-    # ── Collect live node ExternalIPs ─────────────────────────────────────────
-    echo "INFO: listing cluster nodes"
-    HTTP_CODE=$(curl -s -o /tmp/nodes.json -w "%{http_code}" \
-      -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
-      --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-      "https://kubernetes.default.svc/api/v1/nodes")
-    if [ "$HTTP_CODE" != "200" ]; then
-      echo "ERROR: Kubernetes API returned HTTP $HTTP_CODE listing nodes"
-      cat /tmp/nodes.json
-      exit 1
-    fi
+    # ── URL-encode a string using jq ──────────────────────────────────────────
+    urlencode() { printf '%s' "$1" | jq -Rr '@uri'; }
 
-    NODE_IPS=$(jq -r \
-      '.items[].status.addresses[] | select(.type=="ExternalIP") | .address' \
-      /tmp/nodes.json)
-    if [ -z "$NODE_IPS" ]; then
-      echo "WARN: no ExternalIPs found on any node — skipping cleanup to avoid wiping the rule"
-      echo "      (safety guard for transient API issues or internal-only clusters)"
-      exit 0
-    fi
+    # ── Kubernetes API helper (GET) ────────────────────────────────────────────
+    k8s_get() {
+      local path="$1" out="$2" code
+      code=$(curl -s -o "$out" -w "%{http_code}" \
+        -H "Authorization: Bearer $(cat "$K8S_TOKEN_FILE")" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}${path}")
+      if [ "$code" != "200" ]; then
+        echo "ERROR: Kubernetes API ${path} returned HTTP ${code}: $(cat "$out")"
+        return 1
+      fi
+    }
 
-    LIVE_CIDRS=$(echo "$NODE_IPS" | awk '{print $1"/32"}' | sort -u | jq -R . | jq -s .)
-    echo "INFO: live node CIDRs: $(echo "$LIVE_CIDRS" | jq -r '.[]' | tr '\n' ' ')"
+    # ── Leader election ────────────────────────────────────────────────────────
+    # GET the Lease; write response body to $1, return HTTP code.
+    lease_get() {
+      local out="$1"
+      curl -s -o "$out" -w "%{http_code}" \
+        -H "Authorization: Bearer $(cat "$K8S_TOKEN_FILE")" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}"
+    }
 
-    # ── Determine effective rule name ─────────────────────────────────────────
-    # 1. Try the lke.k8s.io/cluster-id label
-    CLUSTER_ID=$(jq -r \
-      '.items[0].metadata.labels["lke.k8s.io/cluster-id"] // empty' \
-      /tmp/nodes.json)
-    # 2. Fall back to parsing the node name (LKE format: lke{cluster_id}-{pool_id}-{node_id})
-    if [ -z "$CLUSTER_ID" ]; then
-      FIRST_NODE=$(jq -r '.items[0].metadata.name' /tmp/nodes.json)
-      CLUSTER_ID=$(echo "$FIRST_NODE" | sed -n 's/^lke\([0-9]*\)-.*/\1/p')
-    fi
-    if [ -n "$CLUSTER_ID" ]; then
-      EFFECTIVE_RULE_NAME="lke-nodes-${CLUSTER_ID}"
-      echo "INFO: LKE cluster ID detected: $CLUSTER_ID — rule name is '$EFFECTIVE_RULE_NAME'"
-    else
-      EFFECTIVE_RULE_NAME="$RULE_NAME"
-      echo "INFO: cluster ID not found in label or node name — using fallback rule name '$EFFECTIVE_RULE_NAME'"
-    fi
+    # PUT (full replace) the Lease with holderIdentity=MY_POD_NAME.
+    # The supplied resourceVersion enables etcd compare-and-swap: concurrent
+    # PUTs with the same resourceVersion are serialised — exactly one wins.
+    lease_put() {
+      local resource_version="$1" body out code
+      out=$(mktemp /tmp/lease_put.XXXXXX)
+      body=$(printf '{
+        "apiVersion":"coordination.k8s.io/v1","kind":"Lease",
+        "metadata":{"name":"%s","namespace":"%s","resourceVersion":"%s"},
+        "spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}
+      }' "$LEASE_NAME" "$MY_NAMESPACE" "$resource_version" \
+         "$MY_POD_NAME" "$LEASE_DURATION_SECONDS" "$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)")
+      code=$(curl -s -o "$out" -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer $(cat "$K8S_TOKEN_FILE")" \
+        -H "Content-Type: application/json" \
+        --cacert "$K8S_CA" \
+        --data "$body" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}")
+      rm -f "$out"
+      [ "$code" = "200" ]
+    }
 
-    # ── Clean each firewall ───────────────────────────────────────────────────
-    OVERALL_OK=1
-    for FIREWALL_ID in $FIREWALL_IDS; do
-      echo "INFO: [fw=$FIREWALL_ID] checking for stale IPs"
-      FW_OK=0
-      MAX_RETRIES=10
-      attempt=1
-
-      while [ "$attempt" -le "$MAX_RETRIES" ]; do
-        if [ "$attempt" -gt 1 ]; then
-          JITTER=$(awk 'BEGIN{srand(); print int(rand()*10)+1}')
-          echo "INFO: [fw=$FIREWALL_ID] retry $attempt/$MAX_RETRIES, waiting ${JITTER}s"
-          sleep "$JITTER"
+    # Loop until this pod holds the Lease.
+    # If two pods race on the same empty/expired Lease they PUT the same
+    # resourceVersion; etcd accepts exactly one — the loser gets 409 and retries.
+    acquire_lease() {
+      echo "INFO: acquiring leader Lease ${LEASE_NAME}"
+      while true; do
+        local f code holder rv dur renew_ts renew_epoch now expired_at
+        f=$(mktemp /tmp/lease_get.XXXXXX)
+        code=$(lease_get "$f")
+        if [ "$code" = "200" ]; then
+          holder=$(jq -r '.spec.holderIdentity // empty' "$f")
+          rv=$(jq -r '.metadata.resourceVersion' "$f")
+          dur=$(jq -r '.spec.leaseDurationSeconds // empty' "$f")
+          renew_ts=$(jq -r '.spec.renewTime // empty' "$f")
+          rm -f "$f"
+          if [ "$holder" = "$MY_POD_NAME" ] || [ -z "$holder" ] || [ -z "$renew_ts" ]; then
+            if lease_put "$rv"; then
+              echo "INFO: leader Lease acquired"
+              return 0
+            else
+              # 409 conflict: another pod raced us. Re-fetch to see if WE actually won
+              # (e.g. if the PUT succeeded but the network timed out).
+              f=$(mktemp /tmp/lease_get_verify.XXXXXX)
+              if [ "$(lease_get "$f")" = "200" ]; then
+                if [ "$(jq -r '.spec.holderIdentity // empty' "$f")" = "$MY_POD_NAME" ]; then
+                  echo "INFO: leader Lease acquired (won race after 409)"
+                  rm -f "$f"; return 0
+                fi
+              fi
+              rm -f "$f"
+            fi
+          else
+            # BusyBox date -d does not support RFC3339 (T and decimal Z).
+            # Convert "YYYY-MM-DDTHH:MM:SS.sssZ" to "YYYY-MM-DD HH:MM:SS" for parsing.
+            renew_epoch=$(date -d "$(echo "$renew_ts" | sed 's/T/ /; s/\..*//')" +%s 2>/dev/null || echo 0)
+            now=$(date -u +%s)
+            # Add 2s grace period to handle clock skew between nodes
+            expired_at=$((renew_epoch + ${dur:-15} + 2))
+            if [ "$now" -gt "$expired_at" ]; then
+              echo "INFO: Lease held by $holder is expired — taking over"
+              if lease_put "$rv"; then
+                echo "INFO: leader Lease acquired"
+                return 0
+              fi
+            else
+              echo "INFO: Lease held by $holder (expires in $((expired_at - now))s) — standby"
+              # Intelligent backoff: sleep until just after expiry, or at most RENEW_INTERVAL_SECONDS
+              local sleep_time=$((expired_at - now + 1))
+              if [ "$sleep_time" -gt "$RENEW_INTERVAL_SECONDS" ]; then sleep_time=$RENEW_INTERVAL_SECONDS; fi
+              if [ "$sleep_time" -lt 1 ]; then sleep_time=1; fi
+              
+              local jitter=0
+              [ -n "${RANDOM:-}" ] && jitter=$((RANDOM % 3))
+              sleep "$((sleep_time + jitter))"
+              continue
+            fi
+          fi
+        else
+          rm -f "$f"
         fi
+        
+        local jitter=0
+        if [ -n "${RANDOM:-}" ]; then
+          jitter=$((RANDOM % 3))
+        fi
+        sleep "$((RENEW_INTERVAL_SECONDS + jitter))"
+      done
+    }
 
-        HTTP_CODE=$(curl -s -o /tmp/rules.json -w "%{http_code}" \
-          -H "Authorization: Bearer $LINODE_TOKEN" \
-          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
-        if [ "$HTTP_CODE" != "200" ]; then
-          echo "WARN: [fw=$FIREWALL_ID] GET rules returned HTTP $HTTP_CODE: $(cat /tmp/rules.json)"
+    # Renew the Lease. Called inside reconcile and the main loop to keep the
+    # Lease alive. If another pod stole the Lease (e.g. leader GC'd), exit
+    # immediately so the Deployment restarts this pod as a fresh standby.
+    renew_lease() {
+      local f code holder rv
+      f=$(mktemp /tmp/lease_renew.XXXXXX)
+      code=$(lease_get "$f")
+      if [ "$code" != "200" ]; then
+        echo "WARN: Lease GET failed (HTTP $code) — will retry"
+        rm -f "$f"; return 0
+      fi
+      holder=$(jq -r '.spec.holderIdentity // empty' "$f")
+      rv=$(jq -r '.metadata.resourceVersion' "$f")
+      rm -f "$f"
+      if [ "$holder" != "$MY_POD_NAME" ]; then
+        echo "ERROR: Lease was taken by $holder — exiting to yield to new leader"
+        exit 1
+      fi
+      lease_put "$rv" || echo "WARN: Lease renewal failed — will retry"
+    }
+
+    release_lease() {
+      echo "INFO: releasing Lease ${LEASE_NAME}"
+      local f code rv out body
+      f=$(mktemp /tmp/lease_rel.XXXXXX)
+      code=$(lease_get "$f")
+      if [ "$code" = "200" ]; then
+        rv=$(jq -r '.metadata.resourceVersion' "$f")
+        rm -f "$f"
+        out=$(mktemp /tmp/lease_rel_put.XXXXXX)
+        body=$(printf '{
+          "apiVersion":"coordination.k8s.io/v1","kind":"Lease",
+          "metadata":{"name":"%s","namespace":"%s","resourceVersion":"%s"},
+          "spec":{"holderIdentity":"","leaseDurationSeconds":%s,"renewTime":"%s"}
+        }' "$LEASE_NAME" "$MY_NAMESPACE" "$rv" "$LEASE_DURATION_SECONDS" \
+           "$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)")
+        curl -s -o "$out" -X PUT \
+          -H "Authorization: Bearer $(cat "$K8S_TOKEN_FILE")" \
+          -H "Content-Type: application/json" \
+          --cacert "$K8S_CA" \
+          --data "$body" \
+          "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}" \
+          >/dev/null 2>&1
+        rm -f "$out"
+      else
+        rm -f "$f"
+      fi
+    }
+
+    # ── Node collection ────────────────────────────────────────────────────────
+    # Collects ExternalIPs of all nodes matching LABEL_SELECTOR.
+    # Writes the full node list to /tmp/nodes.json (reused by provider functions).
+    # Prints newline-separated "IP/32" CIDRs to stdout.
+    # Returns 1 if no IPs found (safety guard — avoids wiping firewall rules on
+    # transient Kubernetes API failures or clusters with internal-only nodes).
+    collect_node_cidrs() {
+      local url="/api/v1/nodes"
+      if [ -n "${LABEL_SELECTOR:-}" ]; then
+        url="${url}?labelSelector=$(urlencode "$LABEL_SELECTOR")"
+      fi
+      if ! k8s_get "$url" /tmp/nodes.json; then
+        return 1
+      fi
+      local ips
+      # Filter to IPv4 ExternalIPs only (exclude IPv6 — Linode ipv4 field rejects them).
+      ips=$(jq -r '.items[].status.addresses[] | select(.type=="ExternalIP") | .address' /tmp/nodes.json \
+            | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+      if [ -z "$ips" ]; then
+        echo "WARN: no IPv4 ExternalIPs found on matching nodes — skipping reconcile to avoid wiping rules"
+        return 1
+      fi
+      echo "$ips" | awk '{print $1"/32"}' | sort -u
+    }
+
+    # ── Linode: determine effective rule name ──────────────────────────────────
+    # 1. Try the lke.k8s.io/cluster-id label (set by some LKE versions).
+    # 2. Fall back to parsing the node name (LKE format: lke{id}-{pool}-{node}).
+    # 3. Fall back to LINODE_RULE_NAME env var.
+    # Reuses /tmp/nodes.json already written by collect_node_cidrs.
+    linode_rule_name() {
+      local cluster_id first_node
+      cluster_id=$(jq -r '.items[0].metadata.labels["lke.k8s.io/cluster-id"] // empty' /tmp/nodes.json)
+      if [ -z "$cluster_id" ]; then
+        first_node=$(jq -r '.items[0].metadata.name // empty' /tmp/nodes.json)
+        cluster_id=$(echo "$first_node" | sed -n 's/^lke\([0-9]*\)-.*/\1/p')
+      fi
+      if [ -n "$cluster_id" ]; then
+        echo "lke-nodes-${cluster_id}"
+      else
+        echo "$LINODE_RULE_NAME"
+      fi
+    }
+
+    # ── Linode reconcile ───────────────────────────────────────────────────────
+    # Full SET reconcile: replaces the managed rule's addresses with exactly the
+    # live node CIDRs. Adds new IPs and removes stale ones in a single GET+PUT
+    # per firewall. Single writer (leader pod only) — no concurrent write race.
+    linode_reconcile() {
+      local live_cidrs="$1" effective_rule live_json code attempt updated
+      effective_rule=$(linode_rule_name)
+      echo "INFO: [linode] rule name: $effective_rule"
+
+      live_json=$(echo "$live_cidrs" | grep -v '^$' | jq -R . | jq -s .)
+
+      for FIREWALL_ID in $LINODE_FIREWALL_IDS; do
+        echo "INFO: [linode fw=$FIREWALL_ID] reconciling"
+
+        # GET with up to 3 retries for transient 5xx
+        attempt=1
+        code=""
+        while [ "$attempt" -le 3 ]; do
+          code=$(curl -s -o /tmp/rules_${FIREWALL_ID}.json -w "%{http_code}" \
+            -H "Authorization: Bearer $LINODE_TOKEN" \
+            "${LINODE_API}/networking/firewalls/${FIREWALL_ID}/rules")
+          [ "$code" = "200" ] && break
+          echo "WARN: [linode fw=$FIREWALL_ID] GET returned HTTP $code (attempt $attempt/3)"
           attempt=$((attempt + 1))
+          sleep 2
+        done
+        if [ "$code" != "200" ]; then
+          echo "ERROR: [linode fw=$FIREWALL_ID] GET failed — skipping this firewall"
           continue
         fi
 
-        EXISTING=$(jq -r --arg l "$EFFECTIVE_RULE_NAME" \
-          '.inbound[] | select(.label==$l) | .label // empty' /tmp/rules.json)
-        if [ -z "$EXISTING" ]; then
-          echo "INFO: [fw=$FIREWALL_ID] rule '$EFFECTIVE_RULE_NAME' not found — nothing to clean"
-          FW_OK=1
-          break
+        local existing_label
+        existing_label=$(jq -r --arg l "$effective_rule" \
+          '.inbound[] | select(.label==$l) | .label // empty' \
+          /tmp/rules_${FIREWALL_ID}.json)
+
+        if [ -z "$existing_label" ]; then
+          # Rule does not exist — create it
+          local rule_count
+          rule_count=$(jq '.inbound | length' /tmp/rules_${FIREWALL_ID}.json)
+          if [ "$rule_count" -ge 25 ]; then
+            echo "ERROR: [linode fw=$FIREWALL_ID] 25-rule limit reached — cannot create '$effective_rule'"
+            continue
+          fi
+          echo "INFO: [linode fw=$FIREWALL_ID] creating rule '$effective_rule'"
+          local new_rule
+          new_rule=$(jq -n \
+            --arg label  "$effective_rule" \
+            --arg action "$LINODE_RULE_ACTION" \
+            --arg proto  "$LINODE_RULE_PROTOCOL" \
+            --arg ports  "$LINODE_RULE_PORTS" \
+            --argjson ips "$live_json" \
+            '{label:$label,action:$action,protocol:$proto,ports:$ports,
+              addresses:{ipv4:$ips}}')
+          updated=$(jq --argjson r "$new_rule" '.inbound += [$r]' \
+            /tmp/rules_${FIREWALL_ID}.json)
+        else
+          # Rule exists — check if an update is actually needed
+          local old_sorted new_sorted
+          old_sorted=$(jq -r --arg l "$effective_rule" \
+            '.inbound[] | select(.label==$l) | .addresses.ipv4[]' \
+            /tmp/rules_${FIREWALL_ID}.json | sort)
+          new_sorted=$(echo "$live_cidrs" | sort)
+          if [ "$old_sorted" = "$new_sorted" ]; then
+            echo "INFO: [linode fw=$FIREWALL_ID] rule '$effective_rule' is up to date — skipping"
+            continue
+          fi
+          local old_count new_count
+          old_count=$(echo "$old_sorted" | grep -c . || true)
+          new_count=$(echo "$new_sorted" | grep -c . || true)
+          echo "INFO: [linode fw=$FIREWALL_ID] updating '$effective_rule' ($old_count → $new_count IPs)"
+          # Atomically replace addresses with the full live set
+          updated=$(jq \
+            --arg l "$effective_rule" --argjson ips "$live_json" \
+            '(.inbound[] | select(.label==$l) | .addresses.ipv4) = $ips' \
+            /tmp/rules_${FIREWALL_ID}.json)
         fi
 
-        OLD_COUNT=$(jq --arg l "$EFFECTIVE_RULE_NAME" \
-          '[.inbound[] | select(.label==$l) | .addresses.ipv4[]] | length' /tmp/rules.json)
-
-        UPDATED=$(jq \
-          --arg l "$EFFECTIVE_RULE_NAME" --argjson live "$LIVE_CIDRS" \
-          '(.inbound[] | select(.label==$l) | .addresses.ipv4)
-             |= map(select(. as $ip | $live | index($ip) != null))' \
-          /tmp/rules.json)
-
-        NEW_COUNT=$(echo "$UPDATED" | jq --arg l "$EFFECTIVE_RULE_NAME" \
-          '[.inbound[] | select(.label==$l) | .addresses.ipv4[]] | length')
-
-        if [ "$OLD_COUNT" -eq "$NEW_COUNT" ]; then
-          echo "INFO: [fw=$FIREWALL_ID] no stale IPs — rule is up to date"
-          FW_OK=1
-          break
-        fi
-
-        REMOVED=$((OLD_COUNT - NEW_COUNT))
-        echo "INFO: [fw=$FIREWALL_ID] removing $REMOVED stale IP(s)"
-
-        HTTP_CODE=$(curl -s -o /tmp/put.json -w "%{http_code}" \
+        code=$(curl -s -o /tmp/put_${FIREWALL_ID}.json -w "%{http_code}" \
           -X PUT \
           -H "Authorization: Bearer $LINODE_TOKEN" \
           -H "Content-Type: application/json" \
-          -d "$UPDATED" \
-          "$LINODE_API/networking/firewalls/$FIREWALL_ID/rules")
+          -d "$updated" \
+          "${LINODE_API}/networking/firewalls/${FIREWALL_ID}/rules")
+        if [ "$code" = "200" ]; then
+          echo "INFO: [linode fw=$FIREWALL_ID] updated successfully"
+        else
+          echo "ERROR: [linode fw=$FIREWALL_ID] PUT returned HTTP $code: $(cat /tmp/put_${FIREWALL_ID}.json)"
+        fi
+      done
+    }
 
-        if [ "$HTTP_CODE" = "200" ]; then
-          echo "INFO: [fw=$FIREWALL_ID] cleanup complete — removed $REMOVED stale IP(s)"
-          FW_OK=1
-          break
+    # ── AWS reconcile ──────────────────────────────────────────────────────────
+    # Updates Security Group ingress rules for the configured port/protocol to
+    # exactly match live_cidrs: authorizes new CIDRs, revokes stale ones.
+    # Uses temp files instead of process substitution (ash/BusyBox compatible).
+    aws_reconcile() {
+      local live_cidrs="$1"
+
+      for SG_ID in $AWS_SECURITY_GROUP_IDS; do
+        echo "INFO: [aws sg=$SG_ID] reconciling"
+
+        if ! aws ec2 describe-security-groups \
+            --group-ids "$SG_ID" \
+            --region "$AWS_REGION" \
+            --output json > /tmp/sg_${SG_ID}.json 2>&1; then
+          echo "ERROR: [aws sg=$SG_ID] describe-security-groups failed: $(cat /tmp/sg_${SG_ID}.json)"
+          continue
         fi
 
-        echo "WARN: [fw=$FIREWALL_ID] PUT returned HTTP $HTTP_CODE: $(cat /tmp/put.json)"
-        case "$HTTP_CODE" in
-          400|401|403)
-            echo "ERROR: [fw=$FIREWALL_ID] non-retryable error"
-            OVERALL_OK=0
-            break
-            ;;
-        esac
-        attempt=$((attempt + 1))
-      done
+        # Extract current CIDRs for the managed port/protocol combo
+        local current_cidrs
+        current_cidrs=$(jq -r \
+          --arg proto "$AWS_PROTOCOL" \
+          --argjson from "$AWS_FROM_PORT" \
+          --argjson to "$AWS_TO_PORT" \
+          '(.SecurityGroups[0].IpPermissions // [])[] |
+           select(.IpProtocol==$proto and .FromPort==$from and .ToPort==$to) |
+           .IpRanges[].CidrIp' \
+          /tmp/sg_${SG_ID}.json 2>/dev/null || true)
 
-      if [ "$FW_OK" = "0" ] && [ "$OVERALL_OK" = "1" ]; then
-        echo "ERROR: [fw=$FIREWALL_ID] exhausted $MAX_RETRIES retries"
-        OVERALL_OK=0
+        # Write sorted lists to temp files (ash has no process substitution)
+        echo "$live_cidrs"    | sort -u | sed '/^$/d' > /tmp/aws_live.txt
+        echo "$current_cidrs" | sort -u | sed '/^$/d' > /tmp/aws_current.txt
+
+        local to_add to_remove
+        to_add=$(comm -23 /tmp/aws_live.txt /tmp/aws_current.txt | grep -v '^$' || true)
+        to_remove=$(comm -13 /tmp/aws_live.txt /tmp/aws_current.txt | grep -v '^$' || true)
+
+        if [ -z "$to_add" ] && [ -z "$to_remove" ]; then
+          echo "INFO: [aws sg=$SG_ID] no changes needed"
+          continue
+        fi
+
+        if [ -n "$to_remove" ]; then
+          local revoke_json
+          revoke_json=$(printf '%s\n' $to_remove | jq -R '{"CidrIp":.}' | jq -s \
+            --arg proto "$AWS_PROTOCOL" \
+            --argjson from "$AWS_FROM_PORT" \
+            --argjson to "$AWS_TO_PORT" \
+            '[{IpProtocol:$proto,FromPort:$from,ToPort:$to,IpRanges:.}]')
+          if aws ec2 revoke-security-group-ingress \
+              --group-id "$SG_ID" \
+              --region "$AWS_REGION" \
+              --ip-permissions "$revoke_json" > /dev/null 2>&1; then
+            echo "INFO: [aws sg=$SG_ID] revoked $(echo "$to_remove" | wc -l | tr -d ' ') stale CIDR(s)"
+          else
+            echo "ERROR: [aws sg=$SG_ID] revoke failed"
+          fi
+        fi
+
+        if [ -n "$to_add" ]; then
+          local auth_json
+          auth_json=$(printf '%s\n' $to_add | jq -R '{"CidrIp":.}' | jq -s \
+            --arg proto "$AWS_PROTOCOL" \
+            --argjson from "$AWS_FROM_PORT" \
+            --argjson to "$AWS_TO_PORT" \
+            '[{IpProtocol:$proto,FromPort:$from,ToPort:$to,IpRanges:.}]')
+          if aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --region "$AWS_REGION" \
+              --ip-permissions "$auth_json" > /dev/null 2>&1; then
+            echo "INFO: [aws sg=$SG_ID] authorized $(echo "$to_add" | wc -l | tr -d ' ') new CIDR(s)"
+          else
+            echo "ERROR: [aws sg=$SG_ID] authorize failed"
+          fi
+        fi
+      done
+    }
+
+    # ── GCP reconcile ──────────────────────────────────────────────────────────
+    # Atomically replaces source-ranges on the VPC firewall rule with live_cidrs.
+    # gcloud's --source-ranges flag is a full replacement — no partial-update race.
+    gcp_reconcile() {
+      local live_cidrs="$1" live_csv
+
+      live_csv=$(echo "$live_cidrs" | sed '/^$/d' | tr '\n' ',' | sed 's/,$//')
+      if [ -z "$live_csv" ]; then
+        echo "WARN: [gcp] no live CIDRs — skipping to avoid wiping firewall rule"
+        return 0
+      fi
+
+      echo "INFO: [gcp rule=$GCP_FIREWALL_RULE_NAME] updating source-ranges: $live_csv"
+      if gcloud compute firewall-rules update "$GCP_FIREWALL_RULE_NAME" \
+          --project="$GCP_PROJECT_ID" \
+          --source-ranges="$live_csv" \
+          --quiet 2>/tmp/gcp_update.log; then
+        echo "INFO: [gcp rule=$GCP_FIREWALL_RULE_NAME] update successful"
+      else
+        echo "ERROR: [gcp rule=$GCP_FIREWALL_RULE_NAME] update failed: $(cat /tmp/gcp_update.log)"
+      fi
+    }
+
+    # ── Full reconcile ─────────────────────────────────────────────────────────
+    # Collects live node IPs then updates all enabled providers.
+    # Called on watch events (after debounce) and on the periodic safety-net timer.
+    reconcile() {
+      renew_lease
+      local live_cidrs
+      if ! live_cidrs=$(collect_node_cidrs); then
+        echo "WARN: skipping reconcile — no node IPs available"
+        return 0
+      fi
+      echo "INFO: live node CIDRs: $(echo "$live_cidrs" | tr '\n' ' ')"
+      if [ "${LINODE_ENABLED:-false}" = "true" ]; then
+        linode_reconcile "$live_cidrs"
+        renew_lease
+      fi
+      if [ "${AWS_ENABLED:-false}" = "true" ]; then
+        aws_reconcile "$live_cidrs"
+        renew_lease
+      fi
+      if [ "${GCP_ENABLED:-false}" = "true" ]; then
+        gcp_reconcile "$live_cidrs"
+        renew_lease
+      fi
+      echo "INFO: reconcile complete"
+    }
+
+    # ── Watch loop ─────────────────────────────────────────────────────────────
+    # Runs as a background process. Streams node watch events from the Kubernetes
+    # API and writes /tmp/reconcile_trigger on ADDED/MODIFIED/DELETED events.
+    # Automatically reconnects if the stream closes (server-side timeouts are normal).
+    watch_nodes() {
+      local url="/api/v1/nodes?watch=true"
+      if [ -n "${LABEL_SELECTOR:-}" ]; then
+        url="${url}&labelSelector=$(urlencode "$LABEL_SELECTOR")"
+      fi
+      # Disable set -e inside the watch loop: the Kubernetes watch stream sends
+      # heartbeat/newline frames that produce empty jq output (exit 1). Under
+      # set -e that would kill the pipe subshell and make $WATCH_PID die, which
+      # the main loop misreads as a crash. set +e keeps the loop alive through
+      # transient parse errors.
+      set +e
+      while true; do
+        echo "INFO: opening node watch stream"
+        curl -sN --no-buffer \
+          --cacert "$K8S_CA" \
+          -H "Authorization: Bearer $(cat "$K8S_TOKEN_FILE")" \
+          "${K8S_API}${url}" | while IFS= read -r line; do
+            local event_type node_name
+            event_type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
+            case "$event_type" in
+              ADDED|MODIFIED|DELETED)
+                node_name=$(printf '%s' "$line" | jq -r '.object.metadata.name // empty' 2>/dev/null)
+                echo "INFO: node event ${event_type}: ${node_name}"
+                touch /tmp/reconcile_trigger
+                ;;
+            esac
+        done
+        echo "WARN: watch stream closed — reconnecting in 5s"
+        sleep 5
+      done
+    }
+
+    # ── GCP authentication ─────────────────────────────────────────────────────
+    gcp_auth() {
+      if [ "${GCP_ENABLED:-false}" = "true" ] && [ -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        echo "INFO: authenticating with GCP service account"
+        gcloud auth activate-service-account \
+          --key-file="$GOOGLE_APPLICATION_CREDENTIALS" \
+          --quiet
+        gcloud config set project "$GCP_PROJECT_ID" --quiet
+      fi
+    }
+
+    # ── Provider validation ────────────────────────────────────────────────────
+    validate_providers() {
+      local any_enabled=false
+      if [ "${LINODE_ENABLED:-false}" = "true" ]; then
+        : "${LINODE_TOKEN:?LINODE_TOKEN is required when providers.linode.enabled=true}"
+        : "${LINODE_FIREWALL_IDS:?LINODE_FIREWALL_IDS is required when providers.linode.enabled=true}"
+        : "${LINODE_RULE_NAME:?LINODE_RULE_NAME is required}"
+        any_enabled=true
+      fi
+      if [ "${AWS_ENABLED:-false}" = "true" ]; then
+        : "${AWS_REGION:?AWS_REGION is required when providers.aws.enabled=true}"
+        : "${AWS_SECURITY_GROUP_IDS:?AWS_SECURITY_GROUP_IDS is required when providers.aws.enabled=true}"
+        any_enabled=true
+      fi
+      if [ "${GCP_ENABLED:-false}" = "true" ]; then
+        : "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required when providers.gcp.enabled=true}"
+        : "${GCP_FIREWALL_RULE_NAME:?GCP_FIREWALL_RULE_NAME is required when providers.gcp.enabled=true}"
+        any_enabled=true
+      fi
+      if [ "$any_enabled" = "false" ]; then
+        echo "ERROR: no providers are enabled"
+        exit 1
+      fi
+    }
+
+    # ── Main ──────────────────────────────────────────────────────────────────
+    echo "INFO: lke-firewall-updater controller starting"
+    echo "INFO:   LABEL_SELECTOR=${LABEL_SELECTOR:-<all nodes>}"
+    echo "INFO:   DEBOUNCE_SECONDS=$DEBOUNCE_SECONDS"
+    echo "INFO:   RECONCILE_INTERVAL=$RECONCILE_INTERVAL"
+    echo "INFO:   providers: linode=${LINODE_ENABLED:-false} aws=${AWS_ENABLED:-false} gcp=${GCP_ENABLED:-false}"
+
+    validate_providers
+    gcp_auth
+    acquire_lease
+
+    trap 'release_lease; exit 0' TERM INT
+
+    # Initial reconcile immediately after acquiring lease
+    reconcile
+
+    # Start watch in background
+    watch_nodes &
+    WATCH_PID=$!
+
+    LAST_RECONCILE=$(date +%s)
+    LAST_RENEWAL=$(date +%s)
+
+    while true; do
+      NOW=$(date +%s)
+
+      # Renew lease periodically (at least once per RENEW_INTERVAL_SECONDS)
+      if [ $((NOW - LAST_RENEWAL)) -ge "$RENEW_INTERVAL_SECONDS" ]; then
+        renew_lease
+        LAST_RENEWAL=$(date +%s)
+        NOW=$LAST_RENEWAL
+      fi
+
+      if [ -f /tmp/reconcile_trigger ]; then
+        # Renew lease *immediately* upon trigger, so we don't lose leadership
+        # while debouncing (sleep $DEBOUNCE_SECONDS).
+        renew_lease
+        # Debounce: wait to absorb burst (e.g. 5 nodes booting at once → 1 reconcile)
+        sleep "$DEBOUNCE_SECONDS"
+        rm -f /tmp/reconcile_trigger
+        reconcile
+        LAST_RECONCILE=$(date +%s)
+        LAST_RENEWAL=$LAST_RECONCILE
+      elif [ $((NOW - LAST_RECONCILE)) -ge "$RECONCILE_INTERVAL" ]; then
+        # Safety-net: periodic full reconcile even when the watch is healthy
+        reconcile
+        LAST_RECONCILE=$(date +%s)
+        LAST_RENEWAL=$LAST_RECONCILE
+      else
+        sleep 1
+      fi
+
+      # Restart watch subprocess if it died unexpectedly
+      if ! kill -0 "$WATCH_PID" 2>/dev/null; then
+        echo "WARN: watch subprocess died — restarting"
+        watch_nodes &
+        WATCH_PID=$!
       fi
     done
-
-    if [ "$OVERALL_OK" = "0" ]; then
-      echo "ERROR: one or more firewalls failed cleanup"
-      exit 1
-    fi
-    echo "INFO: all firewalls cleaned"

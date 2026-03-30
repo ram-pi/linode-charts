@@ -9,9 +9,15 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 rules:
-  # The DaemonSet reads the node's ExternalIP and lke.k8s.io/cluster-id label
-  # via the Kubernetes API to identify the node and name the firewall rule.
-  # The CronJob lists all nodes to determine which IPs are still live.
+  # The controller lists and watches nodes (optionally filtered by labelSelector)
+  # to collect ExternalIPs and reconcile all enabled cloud firewall providers.
+  # watch is required for the event-driven stream; without it the API server
+  # returns 403 and closes the connection immediately.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["list", "get"]
+    verbs: ["list", "get", "watch"]
+  # Leader election: the controller acquires and renews a Kubernetes Lease so
+  # that only one replica (the leader) runs the reconciliation loop at a time.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]

@@ -46,6 +46,23 @@ delete-lke:
 	linode-cli lke cluster-delete $(CLUSTER_ID)
 	@echo "Cluster $(CLUSTER_LABEL) (id=$(CLUSTER_ID)) deleted."
 
+## add-node-pool: Add a node pool with a custom label to CLUSTER_LABEL
+##   Override defaults: CLUSTER_LABEL, NODE_TYPE, POOL_COUNT, POOL_LABEL_KEY, POOL_LABEL_VALUE
+##   Example: make add-node-pool CLUSTER_LABEL=my-cluster POOL_LABEL_KEY=node-type POOL_LABEL_VALUE=worker POOL_COUNT=2
+POOL_COUNT       ?= 1
+POOL_LABEL_KEY   ?= node-type
+POOL_LABEL_VALUE ?= worker
+.PHONY: add-node-pool
+add-node-pool:
+	$(eval CLUSTER_ID := $(shell linode-cli lke clusters-list --json | \
+		jq -r '.[] | select(.label=="$(CLUSTER_LABEL)") | .id'))
+	@test -n "$(CLUSTER_ID)" || (echo "Cluster '$(CLUSTER_LABEL)' not found"; exit 1)
+	linode-cli lke pool-create $(CLUSTER_ID) \
+		--type "$(NODE_TYPE)" \
+		--count $(POOL_COUNT) \
+		--labels '{"$(POOL_LABEL_KEY)":"$(POOL_LABEL_VALUE)"}'
+	@echo "Node pool (type=$(NODE_TYPE) count=$(POOL_COUNT)) added to cluster $(CLUSTER_LABEL) with $(POOL_LABEL_KEY)=$(POOL_LABEL_VALUE)"
+
 ## add-excluded-pool: Add a node pool labelled lke-vlan-controller/exclude=true to CLUSTER_LABEL
 ##   Override defaults: CLUSTER_LABEL, NODE_TYPE, EXCLUDE_POOL_COUNT
 ##   Example: make add-excluded-pool CLUSTER_LABEL=my-cluster EXCLUDE_POOL_COUNT=2

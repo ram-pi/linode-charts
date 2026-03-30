@@ -1,93 +1,75 @@
 # lke-firewall-updater
 
-Keeps one or more [Linode Cloud Firewalls](https://techdocs.akamai.com/cloud-computing/docs/cloud-firewall) in sync with the public IPs of your LKE nodes.
+Keeps your cloud firewalls (Linode, AWS, or GCP) in sync with the public IPs of your Kubernetes nodes.
 
-- **DaemonSet** (`register`) — on each node boot, adds the node's public IP to a named inbound rule in every configured firewall
-- **CronJob** (`cleanup`) — runs on a schedule and removes IPs of nodes that no longer exist
+- **Event-Driven** — watches the Kubernetes API for node changes (join/leave/IP change) and updates firewall rules in near real-time.
+- **Multi-Cloud** — supports Linode Cloud Firewalls, AWS Security Groups, and GCP VPC Firewall Rules simultaneously.
+- **Leader Election** — runs as a highly-available Deployment; only the leader pod performs reconciliations.
 
-The rule is named **`lke-nodes-{cluster_id}`** automatically (using the `lke.k8s.io/cluster-id` label that LKE sets on every node). If the label is absent, it falls back to the `firewall.ruleName` value.
+The managed firewall rules are named **`lke-nodes-{cluster_id}`** automatically.
 
-> **This chart does not create the Cloud Firewall.** You must create the firewall before installing the chart and pass its ID in `firewall.ids`.
+![architecture](lke-firewall-updater.svg)
 
 ---
 
-## Requirements
+## Requirements & Provider Setup
 
-### 1. Linode API token
+### 1. Linode Cloud Firewalls
 
-Create a **Personal Access Token** in the [Linode Cloud Manager](https://cloud.linode.com/profile/tokens) with the following scope:
+- **API Token**: Create a [Personal Access Token](https://cloud.linode.com/profile/tokens) with `Firewalls: Read/Write` scope.
+- **Existing Firewall**: Create a firewall in the Cloud Manager. Note the **Firewall ID** (integer).
 
-| Scope | Access |
-|---|---|
-| **Firewalls** | Read/Write |
+### 2. AWS Security Groups
 
-No other scopes are needed.
+- **Security Group**: Create a Security Group in your VPC. Note the **Group ID** (e.g., `sg-0123456789abcdef0`).
+- **IAM Permissions**: Create an IAM user with an Access Key and the following inline policy:
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ec2:DescribeSecurityGroups",
+          "ec2:AuthorizeSecurityGroupIngress",
+          "ec2:RevokeSecurityGroupIngress"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }
+  ```
 
-### 2. One or more existing Cloud Firewalls
+### 3. GCP VPC Firewall Rules
 
-Create a Cloud Firewall before installing the chart. The chart manages a single **inbound rule entry** within each firewall (named `lke-nodes-{cluster_id}`). All other rules are left untouched.
-
-**Via Linode Cloud Manager:**
-
-1. Go to **Networking → Cloud Firewalls → Create Firewall**
-2. Assign a label (e.g. `lke-egress`) and set default policies
-3. Note the **Firewall ID** from the URL or the firewall list
-
-**Via `linode-cli`:**
-
-```bash
-linode-cli firewalls create \
-  --label lke-egress \
-  --rules.inbound_policy DROP \
-  --rules.outbound_policy ACCEPT
-
-# Note the "id" field in the output
-```
-
-> The firewall does not need any pre-existing rules. The chart creates the `lke-nodes-{cluster_id}` rule entry automatically on the first node boot.
-
-### 3. Kubernetes cluster
-
-- Kubernetes **1.31+**
-- Helm **3.x**
-- Nodes must have `ExternalIP` set in their status addresses (standard on LKE)
+- **Firewall Rule**: Create a VPC firewall rule. Note the **Name**.
+- **Service Account**: Create a Service Account and grant it the `roles/compute.securityAdmin` role (or a custom role with `compute.firewalls.update` and `compute.firewalls.get`).
+- **JSON Key**: Download the Service Account JSON key file.
 
 ---
 
 ## Installation
 
+### Basic (Linode only)
 ```bash
 helm upgrade --install lke-fw-updater charts/lke-firewall-updater \
   --namespace lke-firewall-updater \
   --create-namespace \
-  --set-json 'firewall.ids=[12345]' \
-  --set linodeToken=<YOUR_LINODE_TOKEN>
+  --set providers.linode.token=<TOKEN> \
+  --set-json 'providers.linode.firewall.ids=[12345]'
 ```
 
-Multiple firewalls:
-
+### Multi-Cloud (Linode + AWS)
 ```bash
 helm upgrade --install lke-fw-updater charts/lke-firewall-updater \
   --namespace lke-firewall-updater \
-  --create-namespace \
-  --set-json 'firewall.ids=[12345,67890]' \
-  --set linodeToken=<YOUR_LINODE_TOKEN>
-```
-
-Using an existing Secret instead of `linodeToken`:
-
-```bash
-kubectl create secret generic linode-token \
-  --namespace lke-firewall-updater \
-  --from-literal=token=<YOUR_LINODE_TOKEN> \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-helm upgrade --install lke-fw-updater charts/lke-firewall-updater \
-  --namespace lke-firewall-updater \
-  --create-namespace \
-  --set-json 'firewall.ids=[12345]' \
-  --set existingSecret=linode-token \
-  --set namespace.create=false
+  --set providers.linode.token=<TOKEN> \
+  --set-json 'providers.linode.firewall.ids=[12345]' \
+  --set providers.aws.enabled=true \
+  --set providers.aws.region=us-east-1 \
+  --set providers.aws.accessKeyId=<AWS_KEY> \
+  --set providers.aws.secretAccessKey=<AWS_SECRET> \
+  --set-json 'providers.aws.securityGroupIds=["sg-12345"]'
 ```
 
 ---
@@ -96,86 +78,146 @@ helm upgrade --install lke-fw-updater charts/lke-firewall-updater \
 
 | Parameter | Description | Default |
 |---|---|---|
-| `firewall.ids` | **Required.** List of Linode Cloud Firewall IDs | `[]` |
-| `firewall.ruleName` | Fallback rule label when cluster ID cannot be auto-detected | `lke-nodes` |
-| `firewall.protocol` | Rule protocol | `TCP` |
-| `firewall.ports` | Ports expression (Linode format) | `1-65535` |
-| `firewall.action` | Rule action: `ACCEPT` or `DROP` | `ACCEPT` |
-| `linodeToken` | Linode API token (creates a Secret). Mutually exclusive with `existingSecret` | `""` |
-| `existingSecret` | Name of a pre-existing Secret containing the token | `""` |
-| `secretKey` | Key within the Secret that holds the token value | `token` |
-| `namespace.create` | Create the namespace as part of the Helm release | `true` |
-| `daemonset.enabled` | Enable the node-registration DaemonSet | `true` |
-| `daemonset.image.tag` | DaemonSet image tag | `3.21.3` |
-| `daemonset.tolerations` | Tolerations (e.g. to run on control-plane nodes too) | `[]` |
-| `cronjob.enabled` | Enable the periodic cleanup CronJob | `true` |
-| `cronjob.schedule` | Cron schedule for the cleanup job | `*/15 * * * *` |
-| `cronjob.image.tag` | CronJob image tag | `3.21.3` |
-| `serviceAccount.create` | Create a ServiceAccount | `true` |
+| `nodes.labelSelector` | Kubernetes label selector for filtering nodes | `""` |
+| `controller.replicas` | Number of controller pods (standby pods wait for leader) | `2` |
+| `providers.linode.enabled` | Manage Linode Cloud Firewalls | `true` |
+| `providers.linode.token` | Linode API token | `""` |
+| `providers.linode.firewall.ids` | List of Linode Firewall IDs (integers) | `[]` |
+| `providers.aws.enabled` | Manage AWS Security Groups | `false` |
+| `providers.aws.region` | AWS region | `""` |
+| `providers.aws.accessKeyId` | AWS Access Key ID | `""` |
+| `providers.aws.securityGroupIds` | List of Security Group IDs | `[]` |
+| `providers.gcp.enabled` | Manage GCP VPC Firewall Rules | `false` |
+| `providers.gcp.projectId` | GCP Project ID | `""` |
+| `providers.gcp.firewallRuleName` | Name of the VPC firewall rule | `""` |
+| `providers.gcp.serviceAccountJson`| Content of SA JSON key | `""` |
+
+---
+
+## Architecture
+
+For a detailed visual overview of the event loop, leader election, and multi-cloud reconciliation flow, see [lke-firewall-updater.excalidraw](lke-firewall-updater.excalidraw) (open in [Excalidraw](https://excalidraw.com) or compatible editor).
 
 ---
 
 ## How it works
 
-### Node registration (DaemonSet)
+The controller acquires a **Kubernetes Lease** to ensure a single active leader. Only the leader pod watches the Kubernetes Node API and updates firewalls; standby replicas wait on standby for failover.
 
-When a pod starts on a node it:
+### Event Loop (inside the leader pod)
 
-1. Queries the Kubernetes API for the node object using the pod's own `NODE_NAME` (via Downward API)
-2. Reads the node's `ExternalIP` address and `lke.k8s.io/cluster-id` label
-3. Derives the effective rule name: `lke-nodes-{cluster_id}` (or falls back to `firewall.ruleName`)
-4. For each firewall ID in `firewall.ids`:
-   - Reads the current rules via `GET /v4/networking/firewalls/{id}/rules`
-   - Merges the IP (as a `/32` CIDR) into the managed rule, creating the rule entry if absent
-   - Writes back via `PUT` — retrying up to 10 times with random jitter (1–10 s) on conflicts
-5. Sleeps indefinitely — keeping the DaemonSet pod alive at near-zero CPU
+1. **Watch Stream** — opens a live watch on `/api/v1/nodes` and listens for ADDED, MODIFIED, and DELETED events.
+2. **Debounce Window** — when an event fires, the controller writes a trigger file and waits `debounceSeconds` (default: `5`) before proceeding. This window absorbs burst events (e.g., 10 nodes booting simultaneously) into a single reconciliation, preventing resource waste and API rate limit issues.
+3. **Collect Node IPs** — after the debounce window closes, collect all `ExternalIP` addresses from nodes matching `labelSelector`.
+4. **Atomic Update** — iterate through all enabled providers (Linode, AWS, GCP) in sequence and atomically update firewall rules to match the collected IP set. All providers see the same IP list from the same moment in time.
+5. **Safety Reconciliation** — independent of node watch events, a full reconciliation runs every `reconcileInterval` (default: `60` seconds) as a safety net to catch any drift.
 
-### Stale IP cleanup (CronJob)
+### Leader Election & High Availability
 
-Every 15 minutes (by default) the cleanup job:
+The controller runs as a Deployment with `replicas >= 1`. Replicas compete for a Kubernetes Lease named `lke-firewall-updater-leader`:
+- **Lease holder** (leader): Actively performs reconciliations.
+- **Non-leaders**: Sleep and wait to acquire the lease if the current leader crashes.
+- **Lease renewal**: Leader renews the lease every `leaseDurationSeconds / 2` (default: ~7.5 seconds). If a leader crashes or becomes unresponsive, a standby pod acquires the lease within `leaseDurationSeconds` (default: 15 seconds).
 
-1. Lists all cluster nodes via the Kubernetes API and collects their `ExternalIP` addresses
-2. Detects the LKE cluster ID to derive the same effective rule name
-3. For each firewall ID:
-   - Reads the current rule from the Linode API
-   - Removes any IPs not present in the live node list
-   - Writes back only if something changed (no-op if all IPs are still live)
+### Timing Example
 
-> **Safety guard:** if the Kubernetes API returns no `ExternalIP` addresses (transient failure), the cleanup job exits without making any changes.
+Suppose 10 nodes boot simultaneously:
+- **t=0s**: Node 1 ADDED event fires → debounce trigger written, controller sleeps.
+- **t=0.5s**: Nodes 2–10 ADDED events fire → already sleeping, no action.
+- **t=5s**: Debounce window closes → collect all 10 ExternalIPs, update Linode, AWS, and GCP firewalls once with the full set.
+- **t=60s**: Safety reconciliation fires independently of node events.
 
-### Race condition handling
+Without debouncing, the same work (updating all 3 providers) would run 10 times in rapid succession, wasting API quota and risking rate limit errors.
 
-The Linode Firewall API does not support conditional updates (ETags / CAS). When multiple nodes boot simultaneously they compete on the same read-modify-write. The chart mitigates this with:
+### Firewall Rule Naming & Management
 
-- **Random jitter** (1–10 s) before each retry
-- **`jq unique`** deduplication — adding the same IP twice is a no-op
-- **10 retries max** per firewall
+The firewall rule created and managed by this controller is named **`lke-nodes-{cluster_id}`**, where `cluster_id` is derived from the cluster's unique identifier. The rule does not need to pre-exist; the chart creates it automatically on the first node boot.
 
 ---
 
 ## Troubleshooting
 
-**DaemonSet pod in `CrashLoopBackOff`**
+### Check if the controller is running and healthy
 
 ```bash
-kubectl logs -l app.kubernetes.io/component=register -n lke-firewall-updater
+# Check pod status
+kubectl -n lke-firewall-updater get pods -o wide
+
+# Check logs (leader pod should show reconciliation activity)
+kubectl -n lke-firewall-updater logs -f <pod-name>
+
+# Verify leader election
+kubectl -n lke-firewall-updater get lease lke-firewall-updater-leader -o jsonpath='{.spec.holderIdentity}'
 ```
 
-Common causes:
-- `firewall.ids` contains a wrong ID — verify in the Linode Cloud Manager
-- API token missing `Firewalls: Read/Write` scope
-- Node has no `ExternalIP` — check `kubectl get nodes -o wide`
-
-**Verify the firewall rule via `linode-cli`**
+### Verify node IPs are being collected
 
 ```bash
-linode-cli firewalls rules-list <FIREWALL_ID>
+# Get nodes and their ExternalIPs
+kubectl get nodes -o wide
+
+# The controller log should show collected IPs after each debounce window
+kubectl -n lke-firewall-updater logs <leader-pod-name> | grep -i "external\|collected"
 ```
 
-**Trigger a manual cleanup run**
+### Check cloud provider connectivity
 
+**Linode**:
 ```bash
-kubectl create job --from=cronjob/lke-fw-updater-lke-firewall-updater-cleanup manual-test \
-  -n lke-firewall-updater
-kubectl logs -l job-name=manual-test -n lke-firewall-updater
+# Verify token has Firewalls:Read/Write scope
+curl -H "Authorization: Bearer $LINODE_TOKEN" https://api.linode.com/v4/firewalls
 ```
+
+**AWS**:
+```bash
+# Verify IAM credentials and security group access
+aws ec2 describe-security-groups --group-ids sg-12345 --region us-east-1
+```
+
+**GCP**:
+```bash
+# Verify service account has compute.securityAdmin role
+gcloud compute firewall-rules describe <rule-name> --project <project-id>
+```
+
+### Controller is not reconciling / firewall rules are stale
+
+1. **Check the leader pod is healthy**:
+   ```bash
+   kubectl -n lke-firewall-updater describe pod <leader-pod-name>
+   ```
+
+2. **Verify configuration is loaded**:
+   ```bash
+   kubectl -n lke-firewall-updater get configmap lke-firewall-updater-scripts -o jsonpath='{.data.controller\.sh}' | head -50
+   ```
+
+3. **Force a reconciliation** by scaling the controller down and up (triggers a new lease acquisition):
+   ```bash
+   kubectl -n lke-firewall-updater scale deployment lke-firewall-updater --replicas=0
+   sleep 2
+   kubectl -n lke-firewall-updater scale deployment lke-firewall-updater --replicas=2
+   ```
+
+4. **Check debounce and reconciliation timings** in the logs:
+   ```bash
+   kubectl -n lke-firewall-updater logs <pod> | grep -E "debounce|reconcil|ADDED|MODIFIED"
+   ```
+
+### Rate limit errors from cloud providers
+
+If you see errors like `RateLimitExceeded`, it typically means the controller is reconciling too frequently:
+
+1. **Increase the debounce window** to absorb more burst events:
+   ```bash
+   helm upgrade lke-fw-updater charts/lke-firewall-updater \
+     -n lke-firewall-updater \
+     --set debounceSeconds=10
+   ```
+
+2. **Increase the safety reconciliation interval** to reduce background polling:
+   ```bash
+   helm upgrade lke-fw-updater charts/lke-firewall-updater \
+     -n lke-firewall-updater \
+     --set reconcileInterval=120
+   ```
