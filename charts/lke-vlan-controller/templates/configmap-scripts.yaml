@@ -205,12 +205,16 @@ data:
       # If we find any, it means a previous leader crashed mid-reboot.
       jq -r '.items[] | select(.spec.unschedulable == true and .metadata.labels["lke-vlan-controller-status"] == "pending_reboot") | .metadata.name' "$out" \
         | while read -r node; do
-            # Special case: if it's MY_NODE, we don't uncordon yet, because we might be
-            # in the middle of evict_self. But if we have the lease and are here,
-            # we are the new leader.
-            echo "INFO: cleaning up orphaned cordon on node $node"
-            uncordon_node "$node"
-            label_node "$node" "lke-vlan-controller-status" "cordon_cleaned"
+            # Only clean up when the node is already Ready. If it's still NotReady,
+            # a reboot is likely in progress and uncordoning here causes state flapping.
+            ready=$(jq -r --arg n "$node" '.items[] | select(.metadata.name==$n) | (.status.conditions[] | select(.type=="Ready") | .status)' "$out" 2>/dev/null || true)
+            if [ "$ready" = "True" ]; then
+              echo "INFO: cleaning up orphaned cordon on node $node"
+              uncordon_node "$node"
+              label_node "$node" "lke-vlan-controller-status" "cordon_cleaned"
+            else
+              echo "INFO: node $node still NotReady; leaving cordon in place"
+            fi
           done
       rm -f "$out"
     }
@@ -266,7 +270,7 @@ data:
             lease_put "$rv" && echo "INFO: leader Lease acquired" && return 0
             # 409 conflict: another pod raced us — fall through to sleep
           else
-            renew_epoch=$(date -d "$renew_ts" +%s 2>/dev/null || echo 0)
+            renew_epoch=$(printf '%s' "$renew_ts" | jq -Rr 'sub("\\.[0-9]+Z$";"Z") | (fromdateiso8601? // 0)')
             now=$(date -u +%s)
             expired_at=$((renew_epoch + ${dur:-15}))
             if [ "$now" -gt "$expired_at" ]; then
@@ -311,6 +315,7 @@ data:
     acquire_lease
 
     while true; do
+      renew_lease
       cleanup_orphaned_cordons
 
 
@@ -334,6 +339,7 @@ data:
       NEEDS_REBOOT=""
 
       for NODE_NAME in $NODE_NAMES; do
+        renew_lease
         LINODE_ID=$(linode-cli linodes list --json 2>/dev/null \
           | jq -r --arg label "$NODE_NAME" '.[] | select(.label==$label) | .id' \
           | head -1)
