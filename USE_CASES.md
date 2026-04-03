@@ -47,8 +47,11 @@ helm upgrade --install lke-vlan-controller charts/lke-vlan-controller \
   --create-namespace \
   --set vlan.name=private-lke \
   --set vlan.cidr=172.20.200.0/24 \
-  --set linodeToken=$LINODE_TOKEN
+  --set linodeToken=$LINODE_TOKEN \
+  --set-json 'vlan.excludedIPs=["172.20.200.1"]'
 ```
+
+The `excludedIPs` entry reserves the gateway VM's VLAN IP so the controller never assigns it to a cluster node.
 
 Wait until all nodes have the `vlan-ip` label:
 
@@ -66,21 +69,22 @@ helm upgrade --install lke-route-injector charts/lke-route-injector \
   --create-namespace \
   --set 'routes[0].network=0.0.0.0/0' \
   --set 'routes[0].gateway=172.20.200.1' \
-  --set 'deployment.vlanNodesOnly=true'
+  --set 'deployment.nodeSelector.lke-vlan-controller-status=completed'
 ```
+
+The `nodeSelector` ensures the route injector only runs on nodes where `lke-vlan-controller` has completed the VLAN setup and reboot.
 
 > **Note:** The Kubernetes API server must remain reachable after the default route changes. LKE control plane traffic uses the cluster's internal network, which is unaffected. If you use a Control Plane ACL (LKE Enterprise), ensure the NAT gateway VM's public IP is in the allowlist.
 
 ### Step 6 — Verify egress IP
 
-Run a one-shot pod that queries `ifconfig.me`. The returned IP should be the NAT gateway VM's public IP — not the node's IP.
+Run a one-shot debug pod that queries `ifconfig.me` and verifies the returned IP matches the NAT gateway VM's public IP.
 
 ```bash
-kubectl run egress-test --image=curlimages/curl --restart=Never --rm -it \
-  -- curl -s ifconfig.me
+make verify-nat-gw NAT_GW_IP=<nat-gateway-public-ip>
 ```
 
-Expected output: the public IP of the `nat-gateway` VM.
+Expected output: `PASS: outbound traffic is exiting via the NAT gateway (<ip>)`.
 
 ### Teardown
 
