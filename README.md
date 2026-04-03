@@ -17,7 +17,7 @@ All charts are published to GitHub Container Registry. You can install them dire
 ### lke-firewall-updater
 ```bash
 helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater \
-	--version 0.2.0 \
+	--version 0.2.1 \
 	--namespace lke-firewall-updater \
 	--create-namespace \
 	--set-json 'providers.linode.firewall.ids=[12345]' \
@@ -27,16 +27,16 @@ helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater 
 ### lke-vlan-controller
 ```bash
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller \
-  --version 0.1.1 --namespace lke-vlan-controller --create-namespace \
+  --version 0.2.0 --namespace lke-vlan-controller --create-namespace \
   --set vlan.name=my-vlan --set vlan.cidr=172.20.200.0/24 --set linodeToken=<TOKEN>
 ```
 
 ### lke-route-injector
 ```bash
 helm upgrade --install lke-route-injector oci://ghcr.io/ram-pi/lke-route-injector \
-  --version 0.1.0 --namespace lke-route-injector --create-namespace \
+  --version 0.2.0 --namespace lke-route-injector --create-namespace \
   --set 'routes[0].network=0.0.0.0/0' --set 'routes[0].gateway=172.20.200.1' \
-  --set deployment.vlanNodesOnly=true
+  --set 'deployment.nodeSelector.lke-vlan-controller-status=completed'
 ```
 
 For chart-specific values and more installation options, see each chart's `README.md`.
