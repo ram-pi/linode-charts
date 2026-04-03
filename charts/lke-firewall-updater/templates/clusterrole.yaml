@@ -15,7 +15,13 @@ rules:
   # returns 403 and closes the connection immediately.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["list", "get", "watch"]
+    verbs:
+      - list
+      - get
+      - watch
+      {{- if .Values.nodeLabeling.enabled }}
+      - patch
+      {{- end }}
   # Leader election: the controller acquires and renews a Kubernetes Lease so
   # that only one replica (the leader) runs the reconciliation loop at a time.
   - apiGroups: ["coordination.k8s.io"]

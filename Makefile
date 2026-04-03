@@ -147,9 +147,12 @@ nat-gateway-setup:
 	@echo ""
 	@echo "2. Run the following commands on the VM:"
 	@echo ""
-	@echo "   # Enable IP forwarding (persistent across reboots)"
-	@echo "   sysctl -w net.ipv4.ip_forward=1"
-	@echo "   echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf"
+	@echo "   # Verify interface names (public=eth0, VLAN=eth1 on Linode virtio images)"
+	@echo "   ip addr"
+	@echo ""
+	@echo "   # Enable IP forwarding (persistent via sysctl.d drop-in — Ubuntu 24.04 convention)"
+	@echo "   echo 'net.ipv4.ip_forward = 1' | tee /etc/sysctl.d/99-ip-forward.conf"
+	@echo "   sysctl --system"
 	@echo ""
 	@echo "   # Allow forwarding between VLAN (eth1) and public (eth0)"
 	@echo "   iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT"
@@ -158,8 +161,8 @@ nat-gateway-setup:
 	@echo "   # Masquerade outbound traffic so replies return to the correct node"
 	@echo "   iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
 	@echo ""
-	@echo "   # (Optional) Persist iptables rules across reboots"
-	@echo "   apt-get install -y iptables-persistent && netfilter-persistent save"
+	@echo "   # Persist iptables rules across reboots"
+	@echo "   apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent && netfilter-persistent save"
 	@echo ""
 	@echo "══════════════════════════════════════════════════════════════════════════"
 	@echo ""
@@ -228,6 +231,16 @@ list-vms:
 	} | column -t -s$$'\t'
 
 ## Helm ──────────────────────────────────────────────────────────────────────
+
+## verify-nat-gw: Spin up a debug pod and verify outbound IP matches NAT_GW_IP
+##   Usage: make verify-nat-gw NAT_GW_IP=<public-ip> [NAMESPACE=default]
+##   Example: make verify-nat-gw NAT_GW_IP=45.79.10.1 NAMESPACE=lke-route-injector
+NAT_GW_IP ?=
+NAMESPACE  ?= default
+.PHONY: verify-nat-gw
+verify-nat-gw:
+	@test -n "$(NAT_GW_IP)" || (echo "NAT_GW_IP is required. Usage: make verify-nat-gw NAT_GW_IP=<ip>"; exit 1)
+	./scripts/verify-nat-gw.sh "$(NAT_GW_IP)" "$(NAMESPACE)"
 
 ## lint: Lint all charts under charts/
 .PHONY: lint

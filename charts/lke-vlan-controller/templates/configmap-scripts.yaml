@@ -44,6 +44,7 @@ data:
     : "${LEASE_NAME:?LEASE_NAME is required}"
     : "${LEASE_DURATION_SECONDS:?LEASE_DURATION_SECONDS is required}"
     : "${RENEW_INTERVAL_SECONDS:?RENEW_INTERVAL_SECONDS is required}"
+    EXCLUDED_IPS="${EXCLUDED_IPS:-}"
 
     # Activate Python virtual environment where linode-cli is installed
     . /opt/venv/bin/activate
@@ -116,6 +117,18 @@ data:
         "${K8S_API}/api/v1/namespaces/${MY_NAMESPACE}/pods/${MY_POD_NAME}" >/dev/null
       sleep 30
       exit 0
+    }
+
+    # ── Helper: sleep while renewing the Lease ───────────────────────────────
+    # Splits a long sleep into RENEW_INTERVAL_SECONDS chunks so the Lease never
+    # lapses during idle periods (e.g. the 60s wait between reconcile loops).
+    sleep_renewing() {
+      local total="$1" elapsed=0
+      while [ "$elapsed" -lt "$total" ]; do
+        sleep "$RENEW_INTERVAL_SECONDS"
+        renew_lease
+        elapsed=$((elapsed + RENEW_INTERVAL_SECONDS))
+      done
     }
 
     # ── Helper: generate first free IP from CIDR ─────────────────────────────
@@ -303,8 +316,8 @@ data:
       rv=$(jq -r '.metadata.resourceVersion' "$f")
       rm -f "$f"
       if [ "$holder" != "$MY_POD_NAME" ]; then
-        echo "ERROR: Lease was taken by $holder -- exiting to yield to new leader"
-        exit 1
+        echo "INFO: Lease was taken by $holder -- yielding to new leader"
+        exit 0
       fi
       lease_put "$rv" || echo "WARN: Lease renewal failed -- will retry"
     }
@@ -322,13 +335,13 @@ data:
       # ── 1. List all cluster nodes ──────────────────────────────────────────
       if ! k8s_get "/api/v1/nodes" /tmp/nodes.json; then
         echo "WARN: failed to list nodes -- retrying in 60s"
-        sleep 60
+        sleep_renewing 60
         continue
       fi
       NODE_NAMES=$(jq -r '.items[].metadata.name' /tmp/nodes.json)
       if [ -z "$NODE_NAMES" ]; then
         echo "WARN: no nodes found -- retrying in 60s"
-        sleep 60
+        sleep_renewing 60
         continue
       fi
 
@@ -404,13 +417,21 @@ data:
 
       if [ -z "$NEEDS_CONFIG" ] && [ -z "$NEEDS_REBOOT" ]; then
         echo "INFO: all nodes configured and active -- sleeping 60s"
-        sleep 60
+        sleep_renewing 60
         continue
       fi
 
       # ── 3. Assign VLAN IPs and update Linode configs ──────────────────────
       if [ -n "$NEEDS_CONFIG" ]; then
         USED_IPS_FILE=$(mktemp /tmp/used_ips.XXXXXX)
+
+        # Pre-populate with operator-reserved IPs so generate_ip never picks them.
+        for _eip in $EXCLUDED_IPS; do
+          echo "$_eip" >> "$USED_IPS_FILE"
+        done
+        if [ -n "$EXCLUDED_IPS" ]; then
+          echo "INFO: excluded IPs (reserved): $EXCLUDED_IPS"
+        fi
 
         VLAN_LINODES=$(curl -s \
           -H "Authorization: Bearer ${LINODE_CLI_TOKEN}" \
@@ -482,19 +503,19 @@ data:
 
       # ── 4. Reboot nodes — MY_NODE always last ─────────────────────────────
       if [ -z "$NEEDS_REBOOT" ]; then
-        sleep 60
+        sleep_renewing 60
         continue
       fi
 
       if [ "$REBOOT_ENABLED" != "true" ]; then
         echo "INFO: reboot disabled -- nodes pending reboot:$NEEDS_REBOOT"
-        sleep 60
+        sleep_renewing 60
         continue
       fi
 
       if ! cluster_all_ready; then
         echo "WARN: cluster has NotReady or Cordoned nodes -- deferring reboots"
-        sleep 60
+        sleep_renewing 60
         continue
       fi
 
@@ -543,5 +564,5 @@ data:
       fi
 
       renew_lease
-      sleep 60
+      sleep_renewing 60
     done

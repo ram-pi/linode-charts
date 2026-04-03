@@ -85,6 +85,19 @@ helm upgrade --install lke-vlan-controller \
   --set namespace.create=false
 ```
 
+### Follow logs after installation
+
+```bash
+# Identify the leader pod
+kubectl get lease -n lke-vlan-controller
+
+# Stream logs from the leader pod
+kubectl logs -n lke-vlan-controller -l app.kubernetes.io/name=lke-vlan-controller -f
+
+# Or tail logs from a specific pod
+kubectl logs -n lke-vlan-controller <pod-name> -f
+```
+
 ---
 
 ## Configuration
@@ -93,6 +106,7 @@ helm upgrade --install lke-vlan-controller \
 |---|---|---|
 | `vlan.name` | **Required.** VLAN label to attach | `""` |
 | `vlan.cidr` | **Required.** CIDR to allocate IPs from | `""` |
+| `vlan.excludedIPs` | IPs within the CIDR that the controller must never assign (e.g. gateway, static hosts) | `[]` |
 | `linodeToken` | Inline Linode API token; mutually exclusive with `existingSecret` | `""` |
 | `existingSecret` | Name of a pre-existing Secret that holds the token | `""` |
 | `secretKey` | Key within the Secret that stores the token | `token` |
@@ -145,7 +159,7 @@ The label value is not significant — any non-empty value causes the node to be
    - (if enabled) reboots the Linode and waits for `Ready=true` before the next node
    - sets the `vlan-ip` label only after the node is back to Ready — this is the stateless completion marker
 6. **Deadlock prevention** – the controller's own node is always rebooted last. By the time the pod migrates, all other nodes are Ready and uncordoned.
-7. **Lease renewal** – `renew_lease` is called inside every poll loop iteration so the Lease stays alive during long reboot waits.
+7. **Lease renewal** – `renew_lease` is called inside every poll loop iteration so the Lease stays alive during long reboot waits. During idle sleep periods between reconcile loops, the leader uses `sleep_renewing` (chunked sleep with renewal every `renewIntervalSeconds`) so the Lease never lapses while the cluster is fully configured.
 
 ---
 

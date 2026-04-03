@@ -118,31 +118,35 @@ before joining ensures they are emitted as plain integers (e.g. "4015277 67890")
 {{- end }}
 
 {{/*
-Resolved Linode firewall rule name.
+Resolved rule name — shared across providers.
+Precedence: rule.name → deprecated firewall.ruleName → default.
 */}}
 {{- define "lke-firewall-updater.resolvedRuleName" -}}
-{{- coalesce .Values.providers.linode.firewall.ruleName .Values.firewall.ruleName | default "lke-nodes" }}
+{{- coalesce .Values.rule.name .Values.firewall.ruleName | default "lke-nodes" }}
 {{- end }}
 
 {{/*
-Resolved Linode firewall protocol.
+Resolved rule protocol — shared across providers.
+Precedence: rule.protocol → deprecated firewall.protocol → default.
 */}}
 {{- define "lke-firewall-updater.resolvedProtocol" -}}
-{{- coalesce .Values.providers.linode.firewall.protocol .Values.firewall.protocol | default "TCP" }}
+{{- coalesce .Values.rule.protocol .Values.firewall.protocol | default "TCP" }}
 {{- end }}
 
 {{/*
-Resolved Linode firewall ports.
+Resolved rule ports — shared across providers.
+Precedence: rule.ports → deprecated firewall.ports → default.
 */}}
 {{- define "lke-firewall-updater.resolvedPorts" -}}
-{{- coalesce .Values.providers.linode.firewall.ports .Values.firewall.ports | default "1-65535" }}
+{{- coalesce .Values.rule.ports .Values.firewall.ports | default "1-65535" }}
 {{- end }}
 
 {{/*
-Resolved Linode firewall action.
+Resolved rule action — Linode only; ignored by AWS and GCP.
+Precedence: rule.action → deprecated firewall.action → default.
 */}}
 {{- define "lke-firewall-updater.resolvedAction" -}}
-{{- coalesce .Values.providers.linode.firewall.action .Values.firewall.action | default "ACCEPT" }}
+{{- coalesce .Values.rule.action .Values.firewall.action | default "ACCEPT" }}
 {{- end }}
 
 {{/*

@@ -5,6 +5,17 @@ nodes:
   # Example: "node-role.kubernetes.io/worker=true" or "node-type=worker"
   labelSelector: ""
 
+# ── Node labeling ─────────────────────────────────────────────────────────────
+nodeLabeling:
+  # -- If true, label every node matching nodes.labelSelector after each
+  # successful firewall reconcile. Requires RBAC patch verb on nodes (added
+  # automatically). Disabled by default (principle of least privilege).
+  enabled: false
+  # -- Label key applied to nodes after a successful reconcile.
+  labelKey: "firewall.lke.linode.com/ready"
+  # -- Label value applied to nodes after a successful reconcile.
+  labelValue: "true"
+
 # ── Controller Deployment ─────────────────────────────────────────────────────
 controller:
   # -- Number of replicas. With replicas > 1, leader election via Kubernetes
@@ -40,6 +51,20 @@ leaderElection:
   leaseDurationSeconds: 30
   renewIntervalSeconds: 10
 
+# ── Rule configuration ────────────────────────────────────────────────────────
+# Shared rule settings applied across all enabled providers.
+rule:
+  # -- Fallback rule name/label. Auto-detected as "lke-nodes-{cluster_id}" for
+  # Linode; used as the Description column for AWS Security Group entries.
+  name: "lke-nodes"
+  # -- Protocol. "TCP" or "UDP". Normalized to lowercase for AWS.
+  protocol: "TCP"
+  # -- Port range in Linode format: "22", "80,443", or "1-65535".
+  # For AWS: only single-range format is supported ("X-Y" or "X").
+  ports: "1-65535"
+  # -- Rule action. "ACCEPT" or "DROP". Linode only; ignored by AWS and GCP.
+  action: "ACCEPT"
+
 # ── Providers ─────────────────────────────────────────────────────────────────
 # Enable one or more providers. The controller reconciles all enabled providers
 # on every loop iteration using the same computed node IP list.
@@ -60,15 +85,6 @@ providers:
     firewall:
       # -- REQUIRED. List of Linode Cloud Firewall IDs (integers).
       ids: []
-      # -- Fallback label for the managed inbound rule entry.
-      # Auto-detected as "lke-nodes-{cluster_id}" when possible.
-      ruleName: "lke-nodes"
-      # -- Protocol for the managed rule.
-      protocol: "TCP"
-      # -- Ports expression in Linode format (e.g. "22", "1-65535", "80,443").
-      ports: "1-65535"
-      # -- Rule action: ACCEPT or DROP.
-      action: "ACCEPT"
 
   # ── AWS Security Groups ─────────────────────────────────────────────────────
   aws:
@@ -84,11 +100,6 @@ providers:
     secretAccessKey: ""
     # -- List of Security Group IDs to manage.
     securityGroupIds: []
-    # -- Protocol for managed ingress rules. AWS format: "tcp", "udp", "-1" (all).
-    protocol: "tcp"
-    # -- Ingress port range.
-    fromPort: 0
-    toPort: 65535
 
   # ── GCP VPC Firewall Rules ──────────────────────────────────────────────────
   gcp:

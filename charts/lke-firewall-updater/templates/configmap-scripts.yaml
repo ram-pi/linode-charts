@@ -227,6 +227,60 @@ data:
       echo "$ips" | awk '{print $1"/32"}' | sort -u
     }
 
+    # ── Node labeling ─────────────────────────────────────────────────────────
+    # Applies NODE_LABEL_KEY=NODE_LABEL_VALUE to every node in /tmp/nodes.json
+    # after a successful firewall reconcile. Reuses the cached node list —
+    # no extra Kubernetes API list call. Idempotent: nodes already correctly
+    # labeled are skipped (log message only, no PATCH issued).
+    label_nodes() {
+      if [ "${NODE_LABELING_ENABLED:-false}" != "true" ]; then
+        return 0
+      fi
+
+      local node_names
+      node_names=$(jq -r '.items[].metadata.name' /tmp/nodes.json)
+
+      if [ -z "$node_names" ]; then
+        echo "WARN: [label_nodes] no nodes to label"
+        return 0
+      fi
+
+      local node current_val patch_body out code
+      for node in $node_names; do
+        current_val=$(jq -r \
+          --arg n "$node" \
+          --arg k "$NODE_LABEL_KEY" \
+          '.items[] | select(.metadata.name==$n) | .metadata.labels[$k] // empty' \
+          /tmp/nodes.json)
+
+        if [ "$current_val" = "$NODE_LABEL_VALUE" ]; then
+          echo "INFO: [label_nodes] node $node already labeled $NODE_LABEL_KEY=$NODE_LABEL_VALUE — skipping"
+          continue
+        fi
+
+        patch_body=$(jq -n \
+          --arg k "$NODE_LABEL_KEY" \
+          --arg v "$NODE_LABEL_VALUE" \
+          '{"metadata":{"labels":{($k):$v}}}')
+        out=$(mktemp /tmp/label_node.XXXXXX)
+
+        code=$(curl -s -o "$out" -w "%{http_code}" \
+          -X PATCH \
+          -H "Authorization: Bearer $(cat "$K8S_TOKEN_FILE")" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          --cacert "$K8S_CA" \
+          --data "$patch_body" \
+          "${K8S_API}/api/v1/nodes/${node}")
+
+        if [ "$code" = "200" ]; then
+          echo "INFO: [label_nodes] labeled node $node: $NODE_LABEL_KEY=$NODE_LABEL_VALUE"
+        else
+          echo "ERROR: [label_nodes] failed to label node $node (HTTP $code): $(cat "$out")"
+        fi
+        rm -f "$out"
+      done
+    }
+
     # ── Linode: determine effective rule name ──────────────────────────────────
     # 1. Try the lke.k8s.io/cluster-id label (set by some LKE versions).
     # 2. Fall back to parsing the node name (LKE format: lke{id}-{pool}-{node}).
@@ -242,7 +296,7 @@ data:
       if [ -n "$cluster_id" ]; then
         echo "lke-nodes-${cluster_id}"
       else
-        echo "$LINODE_RULE_NAME"
+        echo "$RULE_NAME"
       fi
     }
 
@@ -294,33 +348,54 @@ data:
           local new_rule
           new_rule=$(jq -n \
             --arg label  "$effective_rule" \
-            --arg action "$LINODE_RULE_ACTION" \
-            --arg proto  "$LINODE_RULE_PROTOCOL" \
-            --arg ports  "$LINODE_RULE_PORTS" \
+            --arg action "$RULE_ACTION" \
+            --arg proto  "$RULE_PROTOCOL" \
+            --arg ports  "$RULE_PORTS" \
             --argjson ips "$live_json" \
             '{label:$label,action:$action,protocol:$proto,ports:$ports,
               addresses:{ipv4:$ips}}')
           updated=$(jq --argjson r "$new_rule" '.inbound += [$r]' \
             /tmp/rules_${FIREWALL_ID}.json)
         else
-          # Rule exists — check if an update is actually needed
-          local old_sorted new_sorted
+          # Rule exists — check if an update is actually needed (CIDRs, ports, protocol, action)
+          local old_sorted new_sorted old_ports old_proto old_action
           old_sorted=$(jq -r --arg l "$effective_rule" \
             '.inbound[] | select(.label==$l) | .addresses.ipv4[]' \
             /tmp/rules_${FIREWALL_ID}.json | sort)
           new_sorted=$(echo "$live_cidrs" | sort)
-          if [ "$old_sorted" = "$new_sorted" ]; then
+          old_ports=$(jq -r --arg l "$effective_rule" \
+            '.inbound[] | select(.label==$l) | .ports' \
+            /tmp/rules_${FIREWALL_ID}.json)
+          old_proto=$(jq -r --arg l "$effective_rule" \
+            '.inbound[] | select(.label==$l) | .protocol' \
+            /tmp/rules_${FIREWALL_ID}.json)
+          old_action=$(jq -r --arg l "$effective_rule" \
+            '.inbound[] | select(.label==$l) | .action' \
+            /tmp/rules_${FIREWALL_ID}.json)
+          if [ "$old_sorted" = "$new_sorted" ] && \
+             [ "$old_ports"  = "$RULE_PORTS" ] && \
+             [ "$old_proto"  = "$RULE_PROTOCOL" ] && \
+             [ "$old_action" = "$RULE_ACTION" ]; then
             echo "INFO: [linode fw=$FIREWALL_ID] rule '$effective_rule' is up to date — skipping"
             continue
           fi
           local old_count new_count
           old_count=$(echo "$old_sorted" | grep -c . || true)
           new_count=$(echo "$new_sorted" | grep -c . || true)
-          echo "INFO: [linode fw=$FIREWALL_ID] updating '$effective_rule' ($old_count → $new_count IPs)"
-          # Atomically replace addresses with the full live set
+          echo "INFO: [linode fw=$FIREWALL_ID] updating '$effective_rule' ($old_count → $new_count IPs, ports=$RULE_PORTS, proto=$RULE_PROTOCOL, action=$RULE_ACTION)"
+          # Atomically replace addresses and rule attributes with the full live set
           updated=$(jq \
-            --arg l "$effective_rule" --argjson ips "$live_json" \
-            '(.inbound[] | select(.label==$l) | .addresses.ipv4) = $ips' \
+            --arg l      "$effective_rule" \
+            --argjson ips "$live_json" \
+            --arg ports  "$RULE_PORTS" \
+            --arg proto  "$RULE_PROTOCOL" \
+            --arg action "$RULE_ACTION" \
+            '(.inbound[] | select(.label==$l)) |= (
+               .addresses.ipv4 = $ips |
+               .ports           = $ports |
+               .protocol        = $proto |
+               .action          = $action
+             )' \
             /tmp/rules_${FIREWALL_ID}.json)
         fi
 
@@ -338,12 +413,62 @@ data:
       done
     }
 
+    # ── AWS: build IpPermissions JSON ─────────────────────────────────────────
+    # Converts a JSON array of CIDR objects into an AWS IpPermissions array,
+    # producing one entry per port spec in RULE_PORTS. Handles comma-separated
+    # ports ("80,443"), single ports ("22"), and ranges ("1-65535").
+    aws_build_permissions() {
+      local cidr_json="$1"
+      local aws_proto
+      aws_proto=$(echo "$RULE_PROTOCOL" | tr '[:upper:]' '[:lower:]')
+      printf '%s\n' "$RULE_PORTS" | tr ',' '\n' | while IFS= read -r port_spec; do
+        port_spec=$(echo "$port_spec" | tr -d ' ')
+        [ -z "$port_spec" ] && continue
+        local from to
+        if echo "$port_spec" | grep -q '-'; then
+          from=$(echo "$port_spec" | cut -d'-' -f1)
+          to=$(echo "$port_spec"   | cut -d'-' -f2)
+        else
+          from="$port_spec"
+          to="$port_spec"
+        fi
+        jq -n \
+          --arg proto "$aws_proto" \
+          --argjson from "$from" \
+          --argjson to "$to" \
+          --argjson ranges "$cidr_json" \
+          '{IpProtocol:$proto,FromPort:$from,ToPort:$to,IpRanges:$ranges}'
+      done | jq -s '.'
+    }
+
     # ── AWS reconcile ──────────────────────────────────────────────────────────
-    # Updates Security Group ingress rules for the configured port/protocol to
+    # Updates Security Group ingress rules for the configured port(s)/protocol to
     # exactly match live_cidrs: authorizes new CIDRs, revokes stale ones.
+    # Supports comma-separated RULE_PORTS ("80,443") — one SG rule per port spec.
+    # Automatically removes rules for port specs no longer in RULE_PORTS, identified
+    # by the managed Description tag set when CIDRs were originally authorized.
     # Uses temp files instead of process substitution (ash/BusyBox compatible).
     aws_reconcile() {
       local live_cidrs="$1"
+      local aws_proto aws_desc
+      aws_proto=$(echo "$RULE_PROTOCOL" | tr '[:upper:]' '[:lower:]')
+      aws_desc=$(linode_rule_name)
+
+      # Build from:to key file for all current port specs (shared across SG loop).
+      rm -f /tmp/aws_current_ports.txt
+      printf '%s\n' "$RULE_PORTS" | tr ',' '\n' | while IFS= read -r ps; do
+        ps=$(echo "$ps" | tr -d ' ')
+        [ -z "$ps" ] && continue
+        local from to
+        if echo "$ps" | grep -q '-'; then
+          from=$(echo "$ps" | cut -d'-' -f1)
+          to=$(echo "$ps"   | cut -d'-' -f2)
+        else
+          from="$ps"
+          to="$ps"
+        fi
+        echo "${from}:${to}" >> /tmp/aws_current_ports.txt
+      done
 
       for SG_ID in $AWS_SECURITY_GROUP_IDS; do
         echo "INFO: [aws sg=$SG_ID] reconciling"
@@ -356,20 +481,71 @@ data:
           continue
         fi
 
-        # Extract current CIDRs for the managed port/protocol combo
-        local current_cidrs
-        current_cidrs=$(jq -r \
-          --arg proto "$AWS_PROTOCOL" \
-          --argjson from "$AWS_FROM_PORT" \
-          --argjson to "$AWS_TO_PORT" \
+        # ── Stale port cleanup ────────────────────────────────────────────────
+        # Find every IpPermissions entry that has at least one IpRange carrying
+        # our managed Description. These are rules we own. Revoke any whose port
+        # spec is no longer in RULE_PORTS (port config changed since last deploy).
+        jq -r \
+          --arg proto "$aws_proto" \
+          --arg desc  "$aws_desc" \
           '(.SecurityGroups[0].IpPermissions // [])[] |
-           select(.IpProtocol==$proto and .FromPort==$from and .ToPort==$to) |
-           .IpRanges[].CidrIp' \
-          /tmp/sg_${SG_ID}.json 2>/dev/null || true)
+           select(.IpProtocol==$proto) |
+           select(any(.IpRanges[]; .Description==$desc)) |
+           "\(.FromPort):\(.ToPort)"' \
+          /tmp/sg_${SG_ID}.json 2>/dev/null | sort -u > /tmp/aws_managed_ports.txt || true
 
-        # Write sorted lists to temp files (ash has no process substitution)
-        echo "$live_cidrs"    | sort -u | sed '/^$/d' > /tmp/aws_live.txt
-        echo "$current_cidrs" | sort -u | sed '/^$/d' > /tmp/aws_current.txt
+        while IFS= read -r port_key; do
+          [ -z "$port_key" ] && continue
+          if ! grep -qx "$port_key" /tmp/aws_current_ports.txt 2>/dev/null; then
+            local s_from s_to stale_cidrs stale_json stale_perm
+            s_from=$(echo "$port_key" | cut -d':' -f1)
+            s_to=$(echo "$port_key"   | cut -d':' -f2)
+            stale_cidrs=$(jq -r \
+              --arg proto "$aws_proto" \
+              --argjson from "$s_from" \
+              --argjson to   "$s_to" \
+              --arg desc     "$aws_desc" \
+              '(.SecurityGroups[0].IpPermissions // [])[] |
+               select(.IpProtocol==$proto and .FromPort==$from and .ToPort==$to) |
+               .IpRanges[] | select(.Description==$desc) | .CidrIp' \
+              /tmp/sg_${SG_ID}.json 2>/dev/null || true)
+            [ -z "$stale_cidrs" ] && continue
+            stale_json=$(printf '%s\n' $stale_cidrs | jq -R '{"CidrIp":.}' | jq -s '.')
+            stale_perm=$(jq -n \
+              --arg proto "$aws_proto" \
+              --argjson from "$s_from" \
+              --argjson to   "$s_to" \
+              --argjson ranges "$stale_json" \
+              '[{IpProtocol:$proto,FromPort:$from,ToPort:$to,IpRanges:$ranges}]')
+            echo "INFO: [aws sg=$SG_ID] removing stale port ${s_from}-${s_to} ($(echo "$stale_cidrs" | wc -l | tr -d ' ') CIDRs)"
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SG_ID" \
+              --region "$AWS_REGION" \
+              --ip-permissions "$stale_perm" > /dev/null 2>&1 || \
+              echo "ERROR: [aws sg=$SG_ID] failed to revoke stale port ${s_from}-${s_to}"
+          fi
+        done < /tmp/aws_managed_ports.txt
+
+        # ── Normal CIDR sync ──────────────────────────────────────────────────
+        # Collect current CIDRs across all current port specs into a temp file.
+        rm -f /tmp/aws_port_cidrs.txt
+        while IFS= read -r port_key; do
+          [ -z "$port_key" ] && continue
+          local c_from c_to
+          c_from=$(echo "$port_key" | cut -d':' -f1)
+          c_to=$(echo "$port_key"   | cut -d':' -f2)
+          jq -r \
+            --arg proto "$aws_proto" \
+            --argjson from "$c_from" \
+            --argjson to   "$c_to" \
+            '(.SecurityGroups[0].IpPermissions // [])[] |
+             select(.IpProtocol==$proto and .FromPort==$from and .ToPort==$to) |
+             .IpRanges[].CidrIp' \
+            /tmp/sg_${SG_ID}.json >> /tmp/aws_port_cidrs.txt 2>/dev/null || true
+        done < /tmp/aws_current_ports.txt
+
+        echo "$live_cidrs" | sort -u | sed '/^$/d' > /tmp/aws_live.txt
+        sort -u /tmp/aws_port_cidrs.txt 2>/dev/null | sed '/^$/d' > /tmp/aws_current.txt
 
         local to_add to_remove
         to_add=$(comm -23 /tmp/aws_live.txt /tmp/aws_current.txt | grep -v '^$' || true)
@@ -381,12 +557,9 @@ data:
         fi
 
         if [ -n "$to_remove" ]; then
-          local revoke_json
-          revoke_json=$(printf '%s\n' $to_remove | jq -R '{"CidrIp":.}' | jq -s \
-            --arg proto "$AWS_PROTOCOL" \
-            --argjson from "$AWS_FROM_PORT" \
-            --argjson to "$AWS_TO_PORT" \
-            '[{IpProtocol:$proto,FromPort:$from,ToPort:$to,IpRanges:.}]')
+          local revoke_cidrs revoke_json
+          revoke_cidrs=$(printf '%s\n' $to_remove | jq -R '{"CidrIp":.}' | jq -s '.')
+          revoke_json=$(aws_build_permissions "$revoke_cidrs")
           if aws ec2 revoke-security-group-ingress \
               --group-id "$SG_ID" \
               --region "$AWS_REGION" \
@@ -398,12 +571,11 @@ data:
         fi
 
         if [ -n "$to_add" ]; then
-          local auth_json
-          auth_json=$(printf '%s\n' $to_add | jq -R '{"CidrIp":.}' | jq -s \
-            --arg proto "$AWS_PROTOCOL" \
-            --argjson from "$AWS_FROM_PORT" \
-            --argjson to "$AWS_TO_PORT" \
-            '[{IpProtocol:$proto,FromPort:$from,ToPort:$to,IpRanges:.}]')
+          local auth_cidrs auth_json
+          auth_cidrs=$(printf '%s\n' $to_add | jq -R \
+            --arg d "$aws_desc" \
+            'if $d != "" then {"CidrIp":.,"Description":$d} else {"CidrIp":.} end' | jq -s '.')
+          auth_json=$(aws_build_permissions "$auth_cidrs")
           if aws ec2 authorize-security-group-ingress \
               --group-id "$SG_ID" \
               --region "$AWS_REGION" \
@@ -417,10 +589,10 @@ data:
     }
 
     # ── GCP reconcile ──────────────────────────────────────────────────────────
-    # Atomically replaces source-ranges on the VPC firewall rule with live_cidrs.
-    # gcloud's --source-ranges flag is a full replacement — no partial-update race.
+    # Atomically replaces source-ranges and rules on the VPC firewall rule.
+    # gcloud's --source-ranges and --rules flags are full replacements — no partial-update race.
     gcp_reconcile() {
-      local live_cidrs="$1" live_csv
+      local live_cidrs="$1" live_csv gcp_proto gcp_rules
 
       live_csv=$(echo "$live_cidrs" | sed '/^$/d' | tr '\n' ',' | sed 's/,$//')
       if [ -z "$live_csv" ]; then
@@ -428,10 +600,20 @@ data:
         return 0
       fi
 
-      echo "INFO: [gcp rule=$GCP_FIREWALL_RULE_NAME] updating source-ranges: $live_csv"
+      # Build GCP rules string: "proto:port,proto:port" from RULE_PROTOCOL and RULE_PORTS.
+      # RULE_PORTS may be a single port ("443"), a range ("1-65535"), or comma-separated ("80,443").
+      gcp_proto=$(echo "$RULE_PROTOCOL" | tr '[:upper:]' '[:lower:]')
+      gcp_rules=$(printf '%s\n' "$RULE_PORTS" | tr ',' '\n' | while IFS= read -r ps; do
+        ps=$(echo "$ps" | tr -d ' ')
+        [ -z "$ps" ] && continue
+        echo "${gcp_proto}:${ps}"
+      done | tr '\n' ',' | sed 's/,$//')
+
+      echo "INFO: [gcp rule=$GCP_FIREWALL_RULE_NAME] updating source-ranges: $live_csv rules: $gcp_rules"
       if gcloud compute firewall-rules update "$GCP_FIREWALL_RULE_NAME" \
           --project="$GCP_PROJECT_ID" \
           --source-ranges="$live_csv" \
+          --rules="$gcp_rules" \
           --quiet 2>/tmp/gcp_update.log; then
         echo "INFO: [gcp rule=$GCP_FIREWALL_RULE_NAME] update successful"
       else
@@ -462,6 +644,7 @@ data:
         gcp_reconcile "$live_cidrs"
         renew_lease
       fi
+      label_nodes
       echo "INFO: reconcile complete"
     }
 
@@ -514,11 +697,15 @@ data:
 
     # ── Provider validation ────────────────────────────────────────────────────
     validate_providers() {
+      # Shared rule config is always required
+      : "${RULE_NAME:?RULE_NAME is required}"
+      : "${RULE_PROTOCOL:?RULE_PROTOCOL is required}"
+      : "${RULE_PORTS:?RULE_PORTS is required}"
+      : "${RULE_ACTION:?RULE_ACTION is required}"
       local any_enabled=false
       if [ "${LINODE_ENABLED:-false}" = "true" ]; then
         : "${LINODE_TOKEN:?LINODE_TOKEN is required when providers.linode.enabled=true}"
         : "${LINODE_FIREWALL_IDS:?LINODE_FIREWALL_IDS is required when providers.linode.enabled=true}"
-        : "${LINODE_RULE_NAME:?LINODE_RULE_NAME is required}"
         any_enabled=true
       fi
       if [ "${AWS_ENABLED:-false}" = "true" ]; then
@@ -530,6 +717,10 @@ data:
         : "${GCP_PROJECT_ID:?GCP_PROJECT_ID is required when providers.gcp.enabled=true}"
         : "${GCP_FIREWALL_RULE_NAME:?GCP_FIREWALL_RULE_NAME is required when providers.gcp.enabled=true}"
         any_enabled=true
+      fi
+      if [ "${NODE_LABELING_ENABLED:-false}" = "true" ]; then
+        : "${NODE_LABEL_KEY:?NODE_LABEL_KEY is required when nodeLabeling.enabled=true}"
+        : "${NODE_LABEL_VALUE:?NODE_LABEL_VALUE is required when nodeLabeling.enabled=true}"
       fi
       if [ "$any_enabled" = "false" ]; then
         echo "ERROR: no providers are enabled"
@@ -543,6 +734,12 @@ data:
     echo "INFO:   DEBOUNCE_SECONDS=$DEBOUNCE_SECONDS"
     echo "INFO:   RECONCILE_INTERVAL=$RECONCILE_INTERVAL"
     echo "INFO:   providers: linode=${LINODE_ENABLED:-false} aws=${AWS_ENABLED:-false} gcp=${GCP_ENABLED:-false}"
+    echo "INFO:   rule: name=$RULE_NAME protocol=$RULE_PROTOCOL ports=$RULE_PORTS action=$RULE_ACTION"
+    if [ "${NODE_LABELING_ENABLED:-false}" = "true" ]; then
+      echo "INFO:   nodeLabeling=true key=$NODE_LABEL_KEY val=$NODE_LABEL_VALUE"
+    else
+      echo "INFO:   nodeLabeling=false"
+    fi
 
     validate_providers
     gcp_auth

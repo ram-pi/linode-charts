@@ -33,13 +33,10 @@ deployment:
       cpu: "50m"
       memory: "128Mi"
   # -- Node selector applied to the DaemonSet pod. Default {} targets ALL nodes.
+  # Example: { vlan-ip: "172.20.200.2_24" } to target a specific VLAN node.
   nodeSelector: {}
   # -- Tolerations for the DaemonSet pod.
   tolerations: []
-  # -- When true, run only on nodes that have the vlan-ip label (any value).
-  # Uses nodeAffinity with operator: Exists so the exact IP value is not required.
-  # lke-vlan-controller sets this label after a successful reboot.
-  vlanNodesOnly: false
 
 serviceAccount:
   # -- If true, create a ServiceAccount. Set to false to bring your own.

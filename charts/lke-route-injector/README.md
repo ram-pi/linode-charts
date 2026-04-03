@@ -34,9 +34,9 @@ helm upgrade --install lke-route-injector charts/lke-route-injector \
   --set 'routes[0].gateway=172.20.200.1'
 ```
 
-### Target only VLAN-enabled nodes
+### Target specific nodes
 
-The `lke-vlan-controller` sets a `vlan-ip` label on each node after a successful reboot. Use this to ensure the route injector only runs where the VLAN interface is active:
+Use `deployment.nodeSelector` to restrict which nodes run the DaemonSet pod:
 
 ```bash
 helm upgrade --install lke-route-injector charts/lke-route-injector \
@@ -44,7 +44,15 @@ helm upgrade --install lke-route-injector charts/lke-route-injector \
   --create-namespace \
   --set 'routes[0].network=10.0.0.0/8' \
   --set 'routes[0].gateway=172.20.200.1' \
-  --set 'deployment.nodeSelector.vlan-ip='
+  --set 'deployment.nodeSelector.node-role=worker'
+```
+
+Or in `values.yaml`:
+
+```yaml
+deployment:
+  nodeSelector:
+    node-role: worker
 ```
 
 ### Multiple routes
@@ -68,6 +76,16 @@ routes:
 
 > **Warning:** Replacing the default route (`0.0.0.0/0`) redirects **all** outbound traffic through the specified gateway. Ensure the gateway node has upstream internet connectivity, otherwise the node will lose access to the Kubernetes API server and external services.
 
+### Follow logs after installation
+
+```bash
+# Stream logs from all route-injector pods (one per node)
+kubectl logs -n lke-route-injector -l app.kubernetes.io/name=lke-route-injector -f
+
+# Or from a specific pod
+kubectl logs -n lke-route-injector <pod-name> -f
+```
+
 ### From OCI (GHCR)
 
 ```bash
@@ -88,10 +106,9 @@ helm upgrade --install lke-route-injector \
 | `routes` | **Required.** List of `{network, gateway}` entries to inject | `[]` |
 | `interval` | Seconds between route re-apply loops | `60` |
 | `deployment.image` | Container image repository/tag/pull policy | `alpine:3.21.3`, `IfNotPresent` |
-| `deployment.resources` | Resource requests/limits | `cpu: 10m/50m`, `memory: 16Mi/32Mi` |
+| `deployment.resources` | Resource requests/limits | `cpu: 10m/50m`, `memory: 64Mi/128Mi` |
 | `deployment.nodeSelector` | Restrict which nodes run the DaemonSet pod | `{}` (all nodes) |
 | `deployment.tolerations` | Tolerations for the DaemonSet pod | `[]` |
-| `deployment.vlanNodesOnly` | When `true`, run only on nodes with the `vlan-ip` label (set by `lke-vlan-controller` after reboot) | `false` |
 | `namespace.create` | Create the namespace as part of this release | `true` |
 | `serviceAccount.create` | Create a ServiceAccount | `true` |
 | `commonLabels` | Labels added to all resources | `{}` |

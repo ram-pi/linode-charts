@@ -76,6 +76,8 @@ spec:
                   fieldPath: spec.nodeName
             - name: EXCLUDE_LABEL_KEY
               value: {{ .Values.exclusion.labelKey | quote }}
+            - name: EXCLUDED_IPS
+              value: {{ join " " .Values.vlan.excludedIPs | quote }}
             - name: LEASE_NAME
               value: {{ include "lke-vlan-controller.fullname" . }}-leader
             - name: LEASE_DURATION_SECONDS
