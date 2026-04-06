@@ -34,6 +34,7 @@ spec:
         checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "lke-firewall-updater.serviceAccountName" . }}
+      priorityClassName: system-cluster-critical
       terminationGracePeriodSeconds: 30
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
@@ -43,6 +44,15 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "lke-firewall-updater.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
       volumes:
         - name: scripts
           configMap:
@@ -145,6 +155,23 @@ spec:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secrets/gcp/key.json
             {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - find /tmp/healthy -mmin -5 2>/dev/null | grep -q .
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy
+            initialDelaySeconds: 30
+            periodSeconds: 10
           volumeMounts:
             - name: scripts
               mountPath: /scripts

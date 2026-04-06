@@ -15,11 +15,17 @@ rules:
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
 
-  # The controller deletes its own pod to reschedule itself onto a safe node
-  # before rebooting the node it is currently running on.
+  # The controller lists pods on a node before drain, deletes stale pods after
+  # reboot, and deletes its own pod to reschedule onto a safe node.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "delete"]
+    verbs: ["get", "list", "delete"]
+
+  # The controller uses the eviction API to gracefully drain pods off a node
+  # before rebooting it.
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
 
   # Leader election: the controller acquires and renews a Lease so that only
   # one pod runs the reconciliation loop even when replicas > 1.

@@ -6,7 +6,7 @@ description: >
   Designed for NAT gateway and VPN gateway use cases where traffic must be
   steered through a VLAN interface.
 type: application
-version: 0.2.0
+version: 0.3.0
 appVersion: "1.0.0"
 keywords:
   - linode

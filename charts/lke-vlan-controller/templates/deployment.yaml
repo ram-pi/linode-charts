@@ -24,6 +24,7 @@ spec:
         checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "lke-vlan-controller.serviceAccountName" . }}
+      priorityClassName: system-cluster-critical
       terminationGracePeriodSeconds: 30
       {{- with .Values.deployment.nodeSelector }}
       nodeSelector:
@@ -33,6 +34,15 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "lke-vlan-controller.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
       volumes:
         - name: scripts
           configMap:
@@ -74,6 +84,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: DRAIN_ENABLED
+              value: {{ .Values.reboot.drain.enabled | quote }}
+            - name: DRAIN_TIMEOUT
+              value: {{ .Values.reboot.drain.timeoutSeconds | quote }}
             - name: EXCLUDE_LABEL_KEY
               value: {{ .Values.exclusion.labelKey | quote }}
             - name: EXCLUDED_IPS
@@ -84,6 +98,23 @@ spec:
               value: {{ .Values.leaderElection.leaseDurationSeconds | quote }}
             - name: RENEW_INTERVAL_SECONDS
               value: {{ .Values.leaderElection.renewIntervalSeconds | quote }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - find /tmp/healthy -mmin -5 2>/dev/null | grep -q .
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy
+            initialDelaySeconds: 30
+            periodSeconds: 10
           volumeMounts:
             - name: scripts
               mountPath: /scripts

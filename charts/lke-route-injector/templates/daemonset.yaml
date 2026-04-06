@@ -54,6 +54,23 @@ spec:
             # Full privilege is not needed.
             capabilities:
               add: ["NET_ADMIN"]
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - find /tmp/healthy -mmin -5 2>/dev/null | grep -q .
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy
+            initialDelaySeconds: 15
+            periodSeconds: 10
           volumeMounts:
             - name: scripts
               mountPath: /scripts

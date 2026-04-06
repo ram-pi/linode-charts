@@ -45,6 +45,8 @@ data:
     : "${LEASE_DURATION_SECONDS:?LEASE_DURATION_SECONDS is required}"
     : "${RENEW_INTERVAL_SECONDS:?RENEW_INTERVAL_SECONDS is required}"
     EXCLUDED_IPS="${EXCLUDED_IPS:-}"
+    DRAIN_ENABLED="${DRAIN_ENABLED:-true}"
+    DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
 
     # Activate Python virtual environment where linode-cli is installed
     . /opt/venv/bin/activate
@@ -103,6 +105,111 @@ data:
     uncordon_node() {
       echo "INFO: uncordoning node $1"
       k8s_patch "/api/v1/nodes/$1" '{"spec":{"unschedulable":false}}'
+    }
+
+    # ── Helper: drain a node (evict non-DaemonSet pods) ─────────────────────
+    # Uses the Kubernetes eviction API to gracefully move pods off the node
+    # before reboot.  DaemonSet-owned pods are skipped (they restart on boot).
+    # Waits up to DRAIN_TIMEOUT seconds for all evictions to complete.
+    drain_node() {
+      local node_name="$1" timeout="${DRAIN_TIMEOUT:-120}"
+      local pods_json elapsed=0 interval=5
+      pods_json=$(mktemp /tmp/drain_pods.XXXXXX)
+
+      echo "INFO: draining node $node_name (timeout ${timeout}s)"
+
+      # List non-terminal pods on this node
+      if ! k8s_get "/api/v1/pods?fieldSelector=spec.nodeName=${node_name},status.phase!=Succeeded,status.phase!=Failed" "$pods_json"; then
+        echo "WARN: failed to list pods on node $node_name -- skipping drain"
+        rm -f "$pods_json"
+        return 0
+      fi
+
+      # Evict each pod that is NOT owned by a DaemonSet
+      local pod_ns pod_name owner_kind evicted=0
+      for row in $(jq -r '.items[] | @base64' "$pods_json"); do
+        pod_ns=$(echo "$row" | base64 -d | jq -r '.metadata.namespace')
+        pod_name=$(echo "$row" | base64 -d | jq -r '.metadata.name')
+        owner_kind=$(echo "$row" | base64 -d | jq -r '(.metadata.ownerReferences // [])[] | .kind' 2>/dev/null | head -1)
+
+        # Skip DaemonSet pods and mirror pods (static pods)
+        if [ "$owner_kind" = "DaemonSet" ]; then
+          continue
+        fi
+        if echo "$row" | base64 -d | jq -e '.metadata.annotations["kubernetes.io/config.mirror"]' >/dev/null 2>&1; then
+          continue
+        fi
+
+        # POST eviction
+        curl -s -o /dev/null -w "" \
+          -X POST \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          -H "Content-Type: application/json" \
+          --cacert "$K8S_CA" \
+          --data "{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${pod_ns}\"}}" \
+          "${K8S_API}/api/v1/namespaces/${pod_ns}/pods/${pod_name}/eviction" 2>/dev/null || true
+        evicted=$((evicted + 1))
+      done
+      rm -f "$pods_json"
+
+      if [ "$evicted" -eq 0 ]; then
+        echo "INFO: no evictable pods on node $node_name"
+        return 0
+      fi
+      echo "INFO: evicted $evicted pod(s) on node $node_name -- waiting for termination"
+
+      # Wait for non-DaemonSet pods to finish terminating
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        renew_lease
+        elapsed=$((elapsed + interval))
+        local remaining_json
+        remaining_json=$(mktemp /tmp/drain_wait.XXXXXX)
+        k8s_get "/api/v1/pods?fieldSelector=spec.nodeName=${node_name},status.phase=Running" "$remaining_json" 2>/dev/null || true
+        local count
+        count=$(jq '[.items[] | select((.metadata.ownerReferences // []) | all(.kind != "DaemonSet"))] | length' "$remaining_json" 2>/dev/null || echo "0")
+        rm -f "$remaining_json"
+        if [ "$count" -eq 0 ]; then
+          echo "INFO: drain complete for node $node_name (${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: $count non-DaemonSet pod(s) still running on $node_name (${elapsed}s elapsed)"
+      done
+      echo "WARN: drain timeout reached for node $node_name -- proceeding with reboot"
+      return 0
+    }
+
+    # ── Helper: clean up stale Error/Unknown pods on a node ──────────────────
+    # After a reboot the API server keeps terminated pod objects in Error or
+    # ContainerStatusUnknown state.  This removes them so they don't clutter
+    # kubectl output.
+    cleanup_stale_pods() {
+      local node_name="$1"
+      local pods_json
+      pods_json=$(mktemp /tmp/cleanup_pods.XXXXXX)
+
+      # Get Failed pods on this node
+      if ! k8s_get "/api/v1/pods?fieldSelector=spec.nodeName=${node_name},status.phase=Failed" "$pods_json"; then
+        rm -f "$pods_json"
+        return 0
+      fi
+
+      local pod_ns pod_name deleted=0
+      for row in $(jq -r '.items[] | @base64' "$pods_json"); do
+        pod_ns=$(echo "$row" | base64 -d | jq -r '.metadata.namespace')
+        pod_name=$(echo "$row" | base64 -d | jq -r '.metadata.name')
+        curl -s -o /dev/null \
+          -X DELETE \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          --cacert "$K8S_CA" \
+          "${K8S_API}/api/v1/namespaces/${pod_ns}/pods/${pod_name}" 2>/dev/null || true
+        deleted=$((deleted + 1))
+      done
+      rm -f "$pods_json"
+
+      if [ "$deleted" -gt 0 ]; then
+        echo "INFO: cleaned up $deleted stale pod(s) on node $node_name"
+      fi
     }
 
     # ── Helper: migrate this pod off its node ─────────────────────────────────
@@ -270,6 +377,7 @@ data:
     acquire_lease() {
       echo "INFO: acquiring leader Lease ${LEASE_NAME}"
       while true; do
+        touch /tmp/healthy
         local f code holder rv dur renew_ts renew_epoch now expired_at
         f=$(mktemp /tmp/lease_get.XXXXXX)
         code=$(lease_get "$f")
@@ -328,6 +436,7 @@ data:
     acquire_lease
 
     while true; do
+      touch /tmp/healthy
       renew_lease
       cleanup_orphaned_cordons
 
@@ -536,9 +645,13 @@ data:
         echo "INFO: rebooting node $NODE_NAME (Linode $LINODE_ID)"
         label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
         cordon_node "$NODE_NAME"
+        if [ "$DRAIN_ENABLED" = "true" ]; then
+          drain_node "$NODE_NAME"
+        fi
         linode-cli linodes reboot "$LINODE_ID" >/dev/null
         wait_node_not_ready "$NODE_NAME"
         wait_node_ready "$NODE_NAME"
+        cleanup_stale_pods "$NODE_NAME"
         # vlan-ip is set only after the node is back to Ready — this is the
         # stateless completion marker.  A crash before this line is safe: the
         # next iteration classifies the node as needs_reboot and reboots again.
@@ -557,6 +670,9 @@ data:
         echo "INFO: all other nodes done -- cordoning $NODE_NAME and migrating self"
         label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
         cordon_node "$NODE_NAME"
+        if [ "$DRAIN_ENABLED" = "true" ]; then
+          drain_node "$NODE_NAME"
+        fi
         evict_self
         # exit 0 in evict_self — never reached in this pod.
         # The replacement pod sees: VLAN in config, no vlan-ip label -> needs_reboot.

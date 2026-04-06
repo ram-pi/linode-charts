@@ -52,6 +52,13 @@ reboot:
   enabled: true
   # -- Seconds to wait for a node to become Ready after reboot before timing out.
   waitTimeoutSeconds: 600
+  drain:
+    # -- Whether to evict non-DaemonSet pods from a node before rebooting it.
+    # Graceful drain prevents pods from being hard-killed and reduces stale
+    # Error/Unknown pods after reboot.
+    enabled: true
+    # -- Seconds to wait for pod evictions to complete before proceeding with reboot.
+    timeoutSeconds: 120
 
 exclusion:
   # -- Label key used to exclude nodes from VLAN assignment and reboots.
@@ -75,10 +82,11 @@ commonAnnotations: {}
 leaderElection:
   # Seconds a Lease is valid without renewal.  After expiry a standby pod
   # takes over.  Must be greater than renewIntervalSeconds.
-  leaseDurationSeconds: 15
+  # 30s tolerates brief API-server latency spikes without unnecessary failovers.
+  leaseDurationSeconds: 30
   # How often the leader renews its Lease.  Called inside wait_node_ready /
   # wait_node_not_ready poll loops so the Lease stays alive during reboots.
-  renewIntervalSeconds: 5
+  renewIntervalSeconds: 10
 
 nameOverride: ""
 fullnameOverride: ""

@@ -90,6 +90,7 @@ data:
     acquire_lease() {
       echo "INFO: acquiring leader Lease ${LEASE_NAME}"
       while true; do
+        touch /tmp/healthy
         local f code holder rv dur renew_ts renew_epoch now expired_at
         f=$(mktemp /tmp/lease_get.XXXXXX)
         code=$(lease_get "$f")
@@ -758,6 +759,7 @@ data:
     LAST_RENEWAL=$(date +%s)
 
     while true; do
+      touch /tmp/healthy
       NOW=$(date +%s)
 
       # Renew lease periodically (at least once per RENEW_INTERVAL_SECONDS)

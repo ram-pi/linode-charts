@@ -31,5 +31,6 @@ data:
         && echo "INFO: route {{ .network }} via {{ .gateway }} applied" \
         || echo "WARN: failed to apply route {{ .network }} via {{ .gateway }}"
       {{- end }}
+      touch /tmp/healthy
       sleep {{ $.Values.interval }}
     done

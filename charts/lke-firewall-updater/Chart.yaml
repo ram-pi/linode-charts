@@ -6,7 +6,7 @@ description: >
   An event-driven single-writer controller (leader election via Kubernetes Lease)
   watches node changes and reconciles all enabled providers with zero race conditions.
 type: application
-version: 0.2.1
+version: 0.3.0
 appVersion: "2.0.0"
 keywords:
   - linode
