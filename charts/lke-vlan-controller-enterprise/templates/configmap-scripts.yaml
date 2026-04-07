@@ -561,21 +561,31 @@ data:
           LINODE_ID=$(echo "$ENTRY" | cut -d: -f2)
           CONFIG_ID=$(echo "$ENTRY" | cut -d: -f3)
 
-          # Safety: ensure cluster is healthy before shutting down a node
-          if ! cluster_all_ready; then
-            echo "WARN: cluster has NotReady or Cordoned nodes -- skipping $NODE_NAME this iteration"
-            continue
-          fi
+          LINODE_STATUS=$(linode-cli linodes view "$LINODE_ID" --json 2>/dev/null \
+            | jq -r '.[0].status' || true)
 
-          # If controller pod runs on the target node, migrate first
-          if [ "$NODE_NAME" = "$MY_NODE_NAME" ]; then
-            echo "INFO: controller pod is on target node $NODE_NAME -- cordoning and migrating self"
-            cordon_node "$NODE_NAME"
-            if [ "$DRAIN_ENABLED" = "true" ]; then
-              drain_node "$NODE_NAME"
+          # Safety: ensure cluster is healthy before shutting down a node.
+          # Exception: If the Linode is already offline (e.g. controller crashed
+          # during a previous update), we MUST proceed to configure and boot it
+          # to restore the cluster.
+          if [ "$LINODE_STATUS" != "offline" ]; then
+            if ! cluster_all_ready; then
+              echo "WARN: cluster has NotReady or Cordoned nodes -- skipping $NODE_NAME this iteration"
+              continue
             fi
-            evict_self
-            # Never reached in this pod instance.
+
+            # If controller pod runs on the target node, migrate first
+            if [ "$NODE_NAME" = "$MY_NODE_NAME" ]; then
+              echo "INFO: controller pod is on target node $NODE_NAME -- cordoning and migrating self"
+              cordon_node "$NODE_NAME"
+              if [ "$DRAIN_ENABLED" = "true" ]; then
+                drain_node "$NODE_NAME"
+              fi
+              evict_self
+              # Never reached in this pod instance.
+            fi
+          else
+            echo "INFO: Linode $LINODE_ID is already offline -- bypassing cluster_all_ready check"
           fi
 
           NEW_IP=$(generate_ip "$VLAN_CIDR" "$USED_IPS_FILE")
@@ -618,14 +628,18 @@ data:
           # The Linode API requires the instance to be offline when a VPC
           # interface is active (enforced on LKE Enterprise).
           label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
-          cordon_node "$NODE_NAME"
-          if [ "$DRAIN_ENABLED" = "true" ]; then
-            drain_node "$NODE_NAME"
-          fi
+          if [ "$LINODE_STATUS" != "offline" ]; then
+            cordon_node "$NODE_NAME"
+            if [ "$DRAIN_ENABLED" = "true" ]; then
+              drain_node "$NODE_NAME"
+            fi
 
-          echo "INFO: shutting down Linode $LINODE_ID (node $NODE_NAME)"
-          linode-cli linodes shutdown "$LINODE_ID" >/dev/null
-          wait_linode_offline "$LINODE_ID"
+            echo "INFO: shutting down Linode $LINODE_ID (node $NODE_NAME)"
+            linode-cli linodes shutdown "$LINODE_ID" >/dev/null
+            wait_linode_offline "$LINODE_ID"
+          else
+            echo "INFO: skipping drain/shutdown for $NODE_NAME (already offline)"
+          fi
 
           echo "INFO: updating config $CONFIG_ID on Linode $LINODE_ID"
           linode-cli linodes config-update "$LINODE_ID" "$CONFIG_ID" \

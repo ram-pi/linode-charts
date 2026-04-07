@@ -42,7 +42,7 @@ The VLAN already exists in the target region. You will supply:
 
 ```bash
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
-  --version 0.2.1 \
+  --version 0.2.2 \
   --namespace lke-vlan-controller \
   --create-namespace \
   --set vlan.name=<VLAN_LABEL> \

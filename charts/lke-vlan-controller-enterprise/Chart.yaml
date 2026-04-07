@@ -7,7 +7,7 @@ description: >
   the Linode Network Helper so DHCP/IPv6 SLAAC and VLAN configuration remain
   functional after reboot.
 type: application
-version: 0.2.1
+version: 0.2.2
 appVersion: "1.0.0"
 keywords:
   - linode

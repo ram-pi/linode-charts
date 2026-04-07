@@ -35,7 +35,7 @@ helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-control
 ### lke-vlan-controller-enterprise
 ```bash
 helm upgrade --install lke-vlan-controller-enterprise oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
-  --version 0.2.1 --namespace lke-vlan-controller --create-namespace \
+  --version 0.2.2 --namespace lke-vlan-controller --create-namespace \
   --set vlan.name=my-vlan --set vlan.cidr=172.20.200.0/24 --set linodeToken=<TOKEN>
 ```
 
