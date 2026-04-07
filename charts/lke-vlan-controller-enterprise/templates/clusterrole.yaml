@@ -1,0 +1,34 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "lke-vlan-controller.fullname" . }}
+  labels:
+    {{- include "lke-vlan-controller.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  # The controller lists, watches, and patches nodes to assign the vlan-ip label,
+  # set annotations, and cordon/uncordon during rolling reboots.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+
+  # The controller lists pods on a node before drain, deletes stale pods after
+  # reboot, and deletes its own pod to reschedule onto a safe node.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+
+  # The controller uses the eviction API to gracefully drain pods off a node
+  # before shutting it down.
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+
+  # Leader election: the controller acquires and renews a Lease so that only
+  # one pod runs the reconciliation loop even when replicas > 1.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]

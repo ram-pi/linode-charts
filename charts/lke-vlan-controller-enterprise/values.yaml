@@ -1,0 +1,91 @@
+# -- VLAN configuration.
+vlan:
+  # -- REQUIRED. VLAN label as it appears in the Linode account (e.g. "my-private-vlan").
+  name: ""
+  # -- REQUIRED. CIDR block to allocate addresses from (e.g. "192.168.128.0/17").
+  cidr: ""
+  # -- List of IPs within the CIDR that the controller must never assign.
+  # Useful for reserving gateway addresses, monitoring agents, or static hosts.
+  # Example: ["172.20.200.1", "172.20.200.2"]
+  excludedIPs: []
+
+# -- Linode API token with Linodes Read/Write scope.
+# Mutually exclusive with existingSecret — set exactly one.
+linodeToken: ""
+
+# -- Name of a pre-existing Kubernetes Secret whose key holds the Linode API token.
+# When set, linodeToken is ignored and no Secret resource is created.
+existingSecret: ""
+
+# -- Key within the Secret that holds the token value.
+secretKey: "token"
+
+namespace:
+  # -- Create the namespace as part of this Helm release.
+  # Set to false if you manage namespaces externally (e.g. via GitOps).
+  create: true
+
+deployment:
+  # Number of controller replicas.  Only one pod runs the reconciliation loop
+  # at a time (enforced via Kubernetes Lease leader election); extra replicas
+  # act as hot standbys that take over within leaseDurationSeconds if the
+  # leader crashes.
+  replicas: 2
+  image:
+    repository: alpine
+    tag: "3.21.3"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  # -- Node selector applied to the controller pod.
+  nodeSelector: {}
+  # -- Tolerations for the controller pod.
+  tolerations: []
+
+boot:
+  # -- Whether to boot nodes after attaching the VLAN interface.
+  # On LKE Enterprise the sequence is: shutdown -> config-update -> boot.
+  enabled: true
+  # -- Seconds to wait for a node to become Ready after boot before timing out.
+  waitTimeoutSeconds: 600
+  drain:
+    # -- Whether to evict non-DaemonSet pods from a node before shutdown.
+    # Graceful drain prevents pods from being hard-killed and reduces stale
+    # Error/Unknown pods after boot.
+    enabled: true
+    # -- Seconds to wait for pod evictions to complete before proceeding.
+    timeoutSeconds: 120
+
+exclusion:
+  # -- Label key used to exclude nodes from VLAN assignment and reboots.
+  # Any node carrying this label (with any non-empty value) is silently skipped.
+  # Set to "" to disable the exclusion feature entirely.
+  labelKey: "lke-vlan-exclude"
+
+serviceAccount:
+  # -- If true, create a ServiceAccount. Set to false to bring your own.
+  create: true
+  # -- Name override. Defaults to the chart fullname.
+  name: ""
+  annotations: {}
+
+# -- Labels added to all resources.
+commonLabels: {}
+# -- Annotations added to all resources.
+commonAnnotations: {}
+
+leaderElection:
+  # Seconds a Lease is valid without renewal.  After expiry a standby pod
+  # takes over.  Must be greater than renewIntervalSeconds.
+  leaseDurationSeconds: 30
+  # How often the leader renews its Lease.  Called inside wait loops so the
+  # Lease stays alive during long shutdown/boot operations.
+  renewIntervalSeconds: 10
+
+nameOverride: ""
+fullnameOverride: ""

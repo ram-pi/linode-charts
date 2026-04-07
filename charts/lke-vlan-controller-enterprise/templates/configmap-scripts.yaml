@@ -1,0 +1,768 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lke-vlan-controller.fullname" . }}-scripts
+  labels:
+    {{- include "lke-vlan-controller.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  register.sh: |
+    #!/bin/sh
+    # register.sh — Stateless VLAN controller for LKE Enterprise.
+    #
+    # Enterprise differences vs standard LKE:
+    #   - Shutdown before config-update (required when VPC interface is active).
+    #   - Boot (not reboot) after config-update (Linode is offline).
+    #   - Do NOT inject public interface (VPC with NAT 1:1 provides connectivity).
+    #   - Preserve VPC interfaces as-is (strip read-only fields: id, active, vpc_id).
+    #
+    # Reconciliation logic (runs every 60s):
+    #   1. List all Kubernetes nodes.
+    #   2. Classify each node via the Linode API:
+    #        needs_config  — VLAN interface absent from Linode config
+    #        needs_reboot  — VLAN in config, vlan-ip label absent from K8s node
+    #        done          — VLAN in config AND vlan-ip label present
+    #   3. For needs_config nodes: assign a free IP, shut down the Linode,
+    #      update the Linode config (offline), then add to needs_reboot.
+    #   4. Boot needs_reboot nodes one at a time (rolling, serialised).
+    #        MY_NODE is always processed last.
+    #   5. Set the vlan-ip label only after the node is back to Ready.
+    set -eu
+
+    # ── Validate required env vars ────────────────────────────────────────────
+    : "${LINODE_CLI_TOKEN:?LINODE_CLI_TOKEN is required}"
+    : "${VLAN_NAME:?VLAN_NAME is required}"
+    : "${VLAN_CIDR:?VLAN_CIDR is required}"
+    : "${BOOT_ENABLED:?BOOT_ENABLED is required}"
+    : "${BOOT_TIMEOUT:?BOOT_TIMEOUT is required}"
+    : "${MY_POD_NAME:?MY_POD_NAME is required}"
+    : "${MY_NAMESPACE:?MY_NAMESPACE is required}"
+    : "${MY_NODE_NAME:?MY_NODE_NAME is required}"
+    : "${LEASE_NAME:?LEASE_NAME is required}"
+    : "${LEASE_DURATION_SECONDS:?LEASE_DURATION_SECONDS is required}"
+    : "${RENEW_INTERVAL_SECONDS:?RENEW_INTERVAL_SECONDS is required}"
+    EXCLUDED_IPS="${EXCLUDED_IPS:-}"
+    DRAIN_ENABLED="${DRAIN_ENABLED:-true}"
+    DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
+
+    # Activate Python virtual environment where linode-cli is installed
+    . /opt/venv/bin/activate
+
+    K8S_TOKEN_FILE=/var/run/secrets/kubernetes.io/serviceaccount/token
+    K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    K8S_API="https://kubernetes.default.svc"
+
+    # ── Helper: call Kubernetes API (GET) ────────────────────────────────────
+    k8s_get() {
+      local path="$1" out="$2"
+      local code
+      code=$(curl -s -o "$out" -w "%{http_code}" \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}${path}")
+      if [ "$code" != "200" ]; then
+        echo "ERROR: Kubernetes API ${path} returned HTTP ${code}: $(cat "$out")"
+        return 1
+      fi
+    }
+
+    # ── Helper: call Kubernetes API (PATCH) ──────────────────────────────────
+    k8s_patch() {
+      local path="$1" body="$2" out
+      out=$(mktemp /tmp/k8s_patch.XXXXXX)
+      local code
+      code=$(curl -s -o "$out" -w "%{http_code}" \
+        -X PATCH \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        -H "Content-Type: application/strategic-merge-patch+json" \
+        --cacert "$K8S_CA" \
+        --data "$body" \
+        "${K8S_API}${path}")
+      if [ "$code" != "200" ]; then
+        echo "ERROR: Kubernetes PATCH ${path} returned HTTP ${code}: $(cat "$out")"
+        rm -f "$out"
+        return 1
+      fi
+      rm -f "$out"
+    }
+
+    # ── Helper: label a node ──────────────────────────────────────────────────
+    label_node() {
+      local node_name="$1" key="$2" value="$3" patch
+      patch=$(printf '{"metadata":{"labels":{"%s":"%s"}}}' "$key" "$value")
+      echo "INFO: labelling node $node_name: $key=$value"
+      k8s_patch "/api/v1/nodes/${node_name}" "$patch"
+    }
+
+    # ── Helper: set or remove a node annotation ──────────────────────────────
+    annotate_node() {
+      local node_name="$1" key="$2" value="$3" patch
+      if [ "$value" = "null" ]; then
+        patch=$(printf '{"metadata":{"annotations":{"%s":null}}}' "$key")
+      else
+        patch=$(printf '{"metadata":{"annotations":{"%s":"%s"}}}' "$key" "$value")
+      fi
+      k8s_patch "/api/v1/nodes/${node_name}" "$patch"
+    }
+
+    # ── Helper: cordon / uncordon a node ─────────────────────────────────────
+    cordon_node() {
+      echo "INFO: cordoning node $1"
+      k8s_patch "/api/v1/nodes/$1" '{"spec":{"unschedulable":true}}'
+    }
+    uncordon_node() {
+      echo "INFO: uncordoning node $1"
+      k8s_patch "/api/v1/nodes/$1" '{"spec":{"unschedulable":false}}'
+    }
+
+    # ── Helper: drain a node (evict non-DaemonSet pods) ─────────────────────
+    drain_node() {
+      local node_name="$1" timeout="${DRAIN_TIMEOUT:-120}"
+      local pods_json elapsed=0 interval=5
+      pods_json=$(mktemp /tmp/drain_pods.XXXXXX)
+
+      echo "INFO: draining node $node_name (timeout ${timeout}s)"
+
+      if ! k8s_get "/api/v1/pods?fieldSelector=spec.nodeName=${node_name},status.phase!=Succeeded,status.phase!=Failed" "$pods_json"; then
+        echo "WARN: failed to list pods on node $node_name -- skipping drain"
+        rm -f "$pods_json"
+        return 0
+      fi
+
+      local pod_ns pod_name owner_kind evicted=0
+      for row in $(jq -r '.items[] | @base64' "$pods_json"); do
+        pod_ns=$(echo "$row" | base64 -d | jq -r '.metadata.namespace')
+        pod_name=$(echo "$row" | base64 -d | jq -r '.metadata.name')
+        owner_kind=$(echo "$row" | base64 -d | jq -r '(.metadata.ownerReferences // [])[] | .kind' 2>/dev/null | head -1)
+
+        if [ "$owner_kind" = "DaemonSet" ]; then
+          continue
+        fi
+        if echo "$row" | base64 -d | jq -e '.metadata.annotations["kubernetes.io/config.mirror"]' >/dev/null 2>&1; then
+          continue
+        fi
+
+        curl -s -o /dev/null -w "" \
+          -X POST \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          -H "Content-Type: application/json" \
+          --cacert "$K8S_CA" \
+          --data "{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":{\"name\":\"${pod_name}\",\"namespace\":\"${pod_ns}\"}}" \
+          "${K8S_API}/api/v1/namespaces/${pod_ns}/pods/${pod_name}/eviction" 2>/dev/null || true
+        evicted=$((evicted + 1))
+      done
+      rm -f "$pods_json"
+
+      if [ "$evicted" -eq 0 ]; then
+        echo "INFO: no evictable pods on node $node_name"
+        return 0
+      fi
+      echo "INFO: evicted $evicted pod(s) on node $node_name -- waiting for termination"
+
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        renew_lease
+        elapsed=$((elapsed + interval))
+        local remaining_json
+        remaining_json=$(mktemp /tmp/drain_wait.XXXXXX)
+        k8s_get "/api/v1/pods?fieldSelector=spec.nodeName=${node_name},status.phase=Running" "$remaining_json" 2>/dev/null || true
+        local count
+        count=$(jq '[.items[] | select((.metadata.ownerReferences // []) | all(.kind != "DaemonSet"))] | length' "$remaining_json" 2>/dev/null || echo "0")
+        rm -f "$remaining_json"
+        if [ "$count" -eq 0 ]; then
+          echo "INFO: drain complete for node $node_name (${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: $count non-DaemonSet pod(s) still running on $node_name (${elapsed}s elapsed)"
+      done
+      echo "WARN: drain timeout reached for node $node_name -- proceeding"
+      return 0
+    }
+
+    # ── Helper: clean up stale Error/Unknown pods on a node ──────────────────
+    cleanup_stale_pods() {
+      local node_name="$1"
+      local pods_json
+      pods_json=$(mktemp /tmp/cleanup_pods.XXXXXX)
+
+      if ! k8s_get "/api/v1/pods?fieldSelector=spec.nodeName=${node_name},status.phase=Failed" "$pods_json"; then
+        rm -f "$pods_json"
+        return 0
+      fi
+
+      local pod_ns pod_name deleted=0
+      for row in $(jq -r '.items[] | @base64' "$pods_json"); do
+        pod_ns=$(echo "$row" | base64 -d | jq -r '.metadata.namespace')
+        pod_name=$(echo "$row" | base64 -d | jq -r '.metadata.name')
+        curl -s -o /dev/null \
+          -X DELETE \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          --cacert "$K8S_CA" \
+          "${K8S_API}/api/v1/namespaces/${pod_ns}/pods/${pod_name}" 2>/dev/null || true
+        deleted=$((deleted + 1))
+      done
+      rm -f "$pods_json"
+
+      if [ "$deleted" -gt 0 ]; then
+        echo "INFO: cleaned up $deleted stale pod(s) on node $node_name"
+      fi
+    }
+
+    # ── Helper: migrate this pod off its node ─────────────────────────────────
+    evict_self() {
+      echo "INFO: deleting self (pod $MY_POD_NAME) to reschedule on another node"
+      curl -s -X DELETE \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}/api/v1/namespaces/${MY_NAMESPACE}/pods/${MY_POD_NAME}" >/dev/null
+      sleep 30
+      exit 0
+    }
+
+    # ── Helper: sleep while renewing the Lease ───────────────────────────────
+    sleep_renewing() {
+      local total="$1" elapsed=0
+      while [ "$elapsed" -lt "$total" ]; do
+        sleep "$RENEW_INTERVAL_SECONDS"
+        renew_lease
+        elapsed=$((elapsed + RENEW_INTERVAL_SECONDS))
+      done
+    }
+
+    # ── Helper: generate first free IP from CIDR ─────────────────────────────
+    generate_ip() {
+      local cidr="$1" used_file="$2"
+      nmap -sL -n "$cidr" 2>/dev/null \
+        | awk '/Nmap scan report/{print $NF}' \
+        | awk 'NR>1' \
+        | while IFS= read -r ip; do
+            if ! grep -qxF "$ip" "$used_file" 2>/dev/null; then
+              echo "$ip"
+              return 0
+            fi
+          done
+    }
+
+    # ── Helper: wait for Linode to reach "offline" status ────────────────────
+    wait_linode_offline() {
+      local linode_id="$1" timeout="${2:-300}"
+      local elapsed=0 interval=10 status
+      echo "INFO: waiting for Linode $linode_id to power off (timeout ${timeout}s)"
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        renew_lease
+        elapsed=$((elapsed + interval))
+        status=$(linode-cli linodes view "$linode_id" --json 2>/dev/null \
+          | jq -r '.[0].status' || true)
+        if [ "$status" = "offline" ]; then
+          echo "INFO: Linode $linode_id is offline (after ${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: Linode $linode_id status=${status} (${elapsed}s elapsed)"
+      done
+      echo "ERROR: Linode $linode_id did not power off within ${timeout}s"
+      return 1
+    }
+
+    # ── Helper: wait for node to go NotReady (post-shutdown signal) ──────────
+    wait_node_not_ready() {
+      local node_name="$1" timeout=120
+      local elapsed=0 interval=10 status
+      echo "INFO: waiting for node $node_name to go NotReady (timeout ${timeout}s)"
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        renew_lease
+        elapsed=$((elapsed + interval))
+        status=$(curl -s \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          --cacert "$K8S_CA" \
+          "${K8S_API}/api/v1/nodes/${node_name}" \
+          | jq -r '.status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || true)
+        if [ "$status" != "True" ]; then
+          echo "INFO: node $node_name is NotReady (after ${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: node $node_name still Ready (${elapsed}s elapsed)"
+      done
+      echo "WARN: node $node_name did not go NotReady within ${timeout}s — proceeding anyway"
+      return 0
+    }
+
+    # ── Helper: wait for node to become Ready ────────────────────────────────
+    wait_node_ready() {
+      local node_name="$1" timeout="${BOOT_TIMEOUT:-300}"
+      local elapsed=0 interval=15 status
+      echo "INFO: waiting for node $node_name to become Ready (timeout ${timeout}s)"
+      while [ "$elapsed" -lt "$timeout" ]; do
+        sleep "$interval"
+        renew_lease
+        elapsed=$((elapsed + interval))
+        status=$(curl -s \
+          -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+          --cacert "$K8S_CA" \
+          "${K8S_API}/api/v1/nodes/${node_name}" \
+          | jq -r '.status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null || true)
+        if [ "$status" = "True" ]; then
+          echo "INFO: node $node_name is Ready (after ${elapsed}s)"
+          return 0
+        fi
+        echo "INFO: node $node_name not yet Ready (${elapsed}s elapsed)"
+      done
+      echo "ERROR: node $node_name did not become Ready within ${timeout}s"
+      return 1
+    }
+
+    # ── Helper: true if all nodes are Ready AND schedulable ───────────────────
+    cluster_all_ready() {
+      local out
+      out=$(mktemp /tmp/nodes_ready.XXXXXX)
+      k8s_get "/api/v1/nodes" "$out" || return 1
+      local bad
+      bad=$(jq -r '.items[] | select((.status.conditions[] | select(.type=="Ready") | .status != "True") or .spec.unschedulable == true) | .metadata.name' "$out")
+      rm -f "$out"
+      if [ -n "$bad" ]; then
+        echo "INFO: cluster not fully ready (degraded nodes: $(echo "$bad" | tr '\n' ' '))"
+        return 1
+      fi
+      return 0
+    }
+
+    # ── Helper: cleanup cordons from crashed leaders ─────────────────────────
+    cleanup_orphaned_cordons() {
+      local out
+      out=$(mktemp /tmp/nodes_cleanup.XXXXXX)
+      k8s_get "/api/v1/nodes" "$out" || return 1
+      # Find any cordoned node that is Ready.  A node left cordoned by a
+      # crashed leader (or old chart version) blocks cluster_all_ready and
+      # deadlocks the entire controller.  Only uncordon if the node is Ready
+      # so we don't interfere with an in-progress shutdown/boot.
+      jq -r '.items[] | select(.spec.unschedulable == true) | .metadata.name' "$out" \
+        | while read -r node; do
+            ready=$(jq -r --arg n "$node" '.items[] | select(.metadata.name==$n) | (.status.conditions[] | select(.type=="Ready") | .status)' "$out" 2>/dev/null || true)
+            if [ "$ready" = "True" ]; then
+              echo "INFO: cleaning up orphaned cordon on node $node"
+              uncordon_node "$node"
+              label_node "$node" "lke-vlan-controller-status" "cordon_cleaned"
+            else
+              echo "INFO: node $node is cordoned and NotReady; leaving cordon in place"
+            fi
+          done
+      rm -f "$out"
+    }
+
+    # ── Leader election helpers ────────────────────────────────────────────────
+    lease_get() {
+      local out="$1"
+      curl -s -o "$out" -w "%{http_code}" \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        --cacert "$K8S_CA" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}"
+    }
+
+    lease_put() {
+      local resource_version="$1" body out code
+      out=$(mktemp /tmp/lease_put.XXXXXX)
+      body=$(printf '{
+        "apiVersion":"coordination.k8s.io/v1","kind":"Lease",
+        "metadata":{"name":"%s","namespace":"%s","resourceVersion":"%s"},
+        "spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}
+      }' "$LEASE_NAME" "$MY_NAMESPACE" "$resource_version" \
+         "$MY_POD_NAME" "$LEASE_DURATION_SECONDS" "$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)")
+      code=$(curl -s -o "$out" -w "%{http_code}" -X PUT \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        -H "Content-Type: application/json" \
+        --cacert "$K8S_CA" \
+        --data "$body" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}")
+      rm -f "$out"
+      [ "$code" = "200" ]
+    }
+
+    acquire_lease() {
+      echo "INFO: acquiring leader Lease ${LEASE_NAME}"
+      while true; do
+        touch /tmp/healthy
+        local f code holder rv dur renew_ts renew_epoch now expired_at
+        f=$(mktemp /tmp/lease_get.XXXXXX)
+        code=$(lease_get "$f")
+        if [ "$code" = "200" ]; then
+          holder=$(jq -r '.spec.holderIdentity // empty' "$f")
+          rv=$(jq -r '.metadata.resourceVersion' "$f")
+          dur=$(jq -r '.spec.leaseDurationSeconds // empty' "$f")
+          renew_ts=$(jq -r '.spec.renewTime // empty' "$f")
+          rm -f "$f"
+          if [ "$holder" = "$MY_POD_NAME" ] || [ -z "$holder" ] || [ -z "$renew_ts" ]; then
+            lease_put "$rv" && echo "INFO: leader Lease acquired" && return 0
+          else
+            renew_epoch=$(printf '%s' "$renew_ts" | jq -Rr 'sub("\\.[0-9]+Z$";"Z") | (fromdateiso8601? // 0)')
+            now=$(date -u +%s)
+            expired_at=$((renew_epoch + ${dur:-30}))
+            if [ "$now" -gt "$expired_at" ]; then
+              echo "INFO: Lease held by $holder is expired, taking over"
+              lease_put "$rv" && echo "INFO: leader Lease acquired" && return 0
+            else
+              echo "INFO: Lease held by $holder (expires in $((expired_at - now))s) -- standby"
+            fi
+          fi
+        else
+          rm -f "$f"
+        fi
+        sleep "$RENEW_INTERVAL_SECONDS"
+      done
+    }
+
+    renew_lease() {
+      local f code holder rv
+      f=$(mktemp /tmp/lease_renew.XXXXXX)
+      code=$(lease_get "$f")
+      if [ "$code" != "200" ]; then
+        echo "WARN: Lease GET failed (HTTP $code) -- will retry"
+        rm -f "$f"; return 0
+      fi
+      holder=$(jq -r '.spec.holderIdentity // empty' "$f")
+      rv=$(jq -r '.metadata.resourceVersion' "$f")
+      rm -f "$f"
+      if [ "$holder" != "$MY_POD_NAME" ]; then
+        echo "INFO: Lease was taken by $holder -- yielding to new leader"
+        exit 0
+      fi
+      lease_put "$rv" || echo "WARN: Lease renewal failed -- will retry"
+    }
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    echo "INFO: lke-vlan-controller-enterprise started -- VLAN=${VLAN_NAME} CIDR=${VLAN_CIDR}"
+
+    acquire_lease
+
+    while true; do
+      touch /tmp/healthy
+      renew_lease
+      cleanup_orphaned_cordons
+
+      # ── 1. List all cluster nodes ──────────────────────────────────────────
+      if ! k8s_get "/api/v1/nodes" /tmp/nodes.json; then
+        echo "WARN: failed to list nodes -- retrying in 60s"
+        sleep_renewing 60
+        continue
+      fi
+      NODE_NAMES=$(jq -r '.items[].metadata.name' /tmp/nodes.json)
+      if [ -z "$NODE_NAMES" ]; then
+        echo "WARN: no nodes found -- retrying in 60s"
+        sleep_renewing 60
+        continue
+      fi
+
+      # ── 2. Classify each node ─────────────────────────────────────────────
+      NEEDS_CONFIG=""
+      NEEDS_REBOOT=""
+
+      for NODE_NAME in $NODE_NAMES; do
+        renew_lease
+        LINODE_ID=$(linode-cli linodes list --json 2>/dev/null \
+          | jq -r --arg label "$NODE_NAME" '.[] | select(.label==$label) | .id' \
+          | head -1)
+        if [ -z "$LINODE_ID" ]; then
+          echo "WARN: no Linode found for node $NODE_NAME -- skipping"
+          continue
+        fi
+
+        # Skip nodes that carry the exclusion label
+        if [ -n "$EXCLUDE_LABEL_KEY" ]; then
+          EXCLUDE_VAL=$(jq -r \
+            --arg n "$NODE_NAME" \
+            --arg key "$EXCLUDE_LABEL_KEY" \
+            '.items[] | select(.metadata.name==$n) | .metadata.labels[$key] // empty' \
+            /tmp/nodes.json)
+          if [ -n "$EXCLUDE_VAL" ]; then
+            echo "INFO: node $NODE_NAME excluded (${EXCLUDE_LABEL_KEY}=${EXCLUDE_VAL}) -- skipping"
+            continue
+          fi
+        fi
+
+        CONFIGS=$(linode-cli linodes configs-list "$LINODE_ID" --json 2>/dev/null)
+        CONFIG_ID=$(echo "$CONFIGS" | jq -r '.[0].id')
+        if [ -z "$CONFIG_ID" ] || [ "$CONFIG_ID" = "null" ]; then
+          echo "WARN: no config found for Linode $LINODE_ID (node $NODE_NAME) -- skipping"
+          continue
+        fi
+
+        HAS_VLAN=$(echo "$CONFIGS" | jq -r \
+          --arg vlan "$VLAN_NAME" \
+          '.[0].interfaces[]? | select(.purpose=="vlan" and .label==$vlan) | .label // empty' \
+          2>/dev/null | head -1)
+        # LKE Enterprise uses VPC interface (NAT 1:1), not public.
+        # Check for either purpose so the controller works on both.
+        HAS_PUBLIC_OR_VPC=$(echo "$CONFIGS" | jq -r \
+          '.[0].interfaces[]? | select(.purpose=="public" or .purpose=="vpc") | .purpose // empty' \
+          2>/dev/null | head -1)
+
+        if [ -z "$HAS_VLAN" ] || [ -z "$HAS_PUBLIC_OR_VPC" ]; then
+          echo "INFO: node $NODE_NAME needs VLAN config"
+          NEEDS_CONFIG="$NEEDS_CONFIG $NODE_NAME:$LINODE_ID:$CONFIG_ID"
+        else
+          # VLAN is in the Linode config.  The vlan-ip label is the completion
+          # marker: it is set only after the node returns to Ready post-boot.
+          HAS_LABEL=$(jq -r \
+            --arg n "$NODE_NAME" \
+            '.items[] | select(.metadata.name==$n) | .metadata.labels["vlan-ip"] // empty' \
+            /tmp/nodes.json)
+          if [ -z "$HAS_LABEL" ]; then
+            VLAN_IP_LABEL=$(echo "$CONFIGS" | jq -r \
+              --arg vlan "$VLAN_NAME" \
+              '.[0].interfaces[] | select(.purpose=="vlan" and .label==$vlan) | .ipam_address' \
+              | tr '/' '_')
+            echo "INFO: node $NODE_NAME has VLAN config but no vlan-ip label -- needs reboot"
+            NEEDS_REBOOT="$NEEDS_REBOOT $NODE_NAME:$LINODE_ID:$VLAN_IP_LABEL"
+          else
+            echo "INFO: node $NODE_NAME is done (vlan-ip=$HAS_LABEL)"
+          fi
+        fi
+      done
+
+      if [ -z "$NEEDS_CONFIG" ] && [ -z "$NEEDS_REBOOT" ]; then
+        echo "INFO: all nodes configured and active -- sleeping 60s"
+        sleep_renewing 60
+        continue
+      fi
+
+      # ── 3. Assign VLAN IPs and update Linode configs ──────────────────────
+      if [ -n "$NEEDS_CONFIG" ]; then
+        USED_IPS_FILE=$(mktemp /tmp/used_ips.XXXXXX)
+
+        # Pre-populate with operator-reserved IPs
+        for _eip in $EXCLUDED_IPS; do
+          echo "$_eip" >> "$USED_IPS_FILE"
+        done
+        if [ -n "$EXCLUDED_IPS" ]; then
+          echo "INFO: excluded IPs (reserved): $EXCLUDED_IPS"
+        fi
+
+        VLAN_LINODES=$(curl -s \
+          -H "Authorization: Bearer ${LINODE_CLI_TOKEN}" \
+          "https://api.linode.com/v4beta/networking/vlans" \
+          | jq -r --arg vlan "$VLAN_NAME" \
+              '.data[] | select(.label==$vlan) | .linodes[]' 2>/dev/null || true)
+
+        for VL_ID in $VLAN_LINODES; do
+          linode-cli linodes configs-list "$VL_ID" --json 2>/dev/null \
+            | jq -r \
+              --arg vlan "$VLAN_NAME" \
+              '.[].interfaces[] | select(.purpose=="vlan" and .label==$vlan) | .ipam_address // empty' \
+            | sed 's|/[0-9]*$||' \
+            >> "$USED_IPS_FILE" 2>/dev/null || true
+        done
+        echo "INFO: used IPs on VLAN ${VLAN_NAME}: $(tr '\n' ' ' < "$USED_IPS_FILE")"
+
+        for ENTRY in $NEEDS_CONFIG; do
+          NODE_NAME=$(echo "$ENTRY" | cut -d: -f1)
+          LINODE_ID=$(echo "$ENTRY" | cut -d: -f2)
+          CONFIG_ID=$(echo "$ENTRY" | cut -d: -f3)
+
+          # Safety: ensure cluster is healthy before shutting down a node
+          if ! cluster_all_ready; then
+            echo "WARN: cluster has NotReady or Cordoned nodes -- skipping $NODE_NAME this iteration"
+            continue
+          fi
+
+          # If controller pod runs on the target node, migrate first
+          if [ "$NODE_NAME" = "$MY_NODE_NAME" ]; then
+            echo "INFO: controller pod is on target node $NODE_NAME -- cordoning and migrating self"
+            cordon_node "$NODE_NAME"
+            if [ "$DRAIN_ENABLED" = "true" ]; then
+              drain_node "$NODE_NAME"
+            fi
+            evict_self
+            # Never reached in this pod instance.
+          fi
+
+          NEW_IP=$(generate_ip "$VLAN_CIDR" "$USED_IPS_FILE")
+          if [ -z "$NEW_IP" ]; then
+            echo "ERROR: CIDR $VLAN_CIDR is exhausted -- no free IPs"
+            break
+          fi
+          IPAM="${NEW_IP}/24"
+          echo "INFO: assigning $IPAM to node $NODE_NAME (Linode $LINODE_ID)"
+          echo "$NEW_IP" >> "$USED_IPS_FILE"
+
+          CURRENT_CONFIG=$(linode-cli linodes config-view "$LINODE_ID" "$CONFIG_ID" --json 2>/dev/null \
+            | jq '.[0]')
+
+          # Build updated config JSON:
+          #   - Preserve ALL existing non-VLAN interfaces (strip read-only fields)
+          #   - Do NOT inject a public interface (VPC with NAT 1:1 provides connectivity)
+          #   - Keep helpers.network intact (Network Helper is needed to configure the VLAN interface)
+          UPDATED_CONFIG=$(echo "$CURRENT_CONFIG" | jq -c \
+            --arg vlan "$VLAN_NAME" \
+            --arg ipam "$IPAM" \
+            '{
+              kernel: .kernel,
+              run_level: .run_level,
+              virt_mode: .virt_mode,
+              root_device: .root_device,
+              helpers: .helpers,
+              devices: .devices,
+              memory_limit: .memory_limit,
+              comments: (.comments // ""),
+              interfaces: (
+                [.interfaces[] | select(.purpose != "vlan" or .label != $vlan)
+                  | del(.id, .active, .vpc_id)
+                  | if .purpose == "vpc" and .ipv6 != null then .ipv6.is_public = true else . end]
+                + [{"purpose":"vlan","label":$vlan,"ipam_address":$ipam}]
+              )
+            }')
+
+          # Cordon, drain, and shut down before config-update.
+          # The Linode API requires the instance to be offline when a VPC
+          # interface is active (enforced on LKE Enterprise).
+          label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
+          cordon_node "$NODE_NAME"
+          if [ "$DRAIN_ENABLED" = "true" ]; then
+            drain_node "$NODE_NAME"
+          fi
+
+          echo "INFO: shutting down Linode $LINODE_ID (node $NODE_NAME)"
+          linode-cli linodes shutdown "$LINODE_ID" >/dev/null
+          wait_linode_offline "$LINODE_ID"
+
+          echo "INFO: updating config $CONFIG_ID on Linode $LINODE_ID"
+          linode-cli linodes config-update "$LINODE_ID" "$CONFIG_ID" \
+            --raw-body "$UPDATED_CONFIG" \
+            >/dev/null
+          echo "INFO: config updated for node $NODE_NAME"
+
+          # Boot and wait for Ready.
+          # vlan-ip label is set AFTER boot succeeds (stateless completion marker).
+          VLAN_IP_LABEL=$(echo "$IPAM" | tr '/' '_')
+          echo "INFO: booting Linode $LINODE_ID (node $NODE_NAME)"
+          linode-cli linodes boot "$LINODE_ID" >/dev/null
+          wait_node_not_ready "$NODE_NAME"
+          wait_node_ready "$NODE_NAME"
+          cleanup_stale_pods "$NODE_NAME"
+
+          label_node "$NODE_NAME" "vlan-ip" "$VLAN_IP_LABEL"
+          label_node "$NODE_NAME" "lke-vlan-controller-status" "completed"
+          uncordon_node "$NODE_NAME"
+          echo "INFO: node $NODE_NAME successfully configured and booted"
+        done
+
+        rm -f "$USED_IPS_FILE"
+      fi
+
+      # ── 4. Boot nodes that have VLAN config but no vlan-ip label ──────────
+      # These nodes were configured (possibly by a previous pod) but never
+      # successfully booted, or the pod crashed before setting the label.
+      #
+      # Two phases:
+      #   a) Already-degraded nodes (Linode offline OR K8s node NotReady) —
+      #      cycle immediately.  These nodes are already not serving traffic,
+      #      so shutting down + booting can only improve cluster health.
+      #      This prevents deadlocks where a NotReady node blocks
+      #      cluster_all_ready which blocks its own reboot.
+      #   b) Healthy running nodes — require cluster_all_ready before
+      #      shutting down (to avoid taking multiple healthy nodes offline).
+      if [ -n "$NEEDS_REBOOT" ]; then
+        if [ "$BOOT_ENABLED" != "true" ]; then
+          echo "INFO: reboot disabled -- nodes pending reboot:$NEEDS_REBOOT"
+          sleep_renewing 60
+          continue
+        fi
+
+        MY_NODE_ENTRY=""
+        STILL_NEEDS_SHUTDOWN=""
+
+        # Phase A: cycle nodes that are already degraded.
+        for ENTRY in $NEEDS_REBOOT; do
+          NODE_NAME=$(echo "$ENTRY"     | cut -d: -f1)
+          LINODE_ID=$(echo "$ENTRY"     | cut -d: -f2)
+          VLAN_IP_LABEL=$(echo "$ENTRY" | cut -d: -f3)
+
+          if [ "$NODE_NAME" = "$MY_NODE_NAME" ]; then
+            MY_NODE_ENTRY="$ENTRY"
+            continue
+          fi
+
+          LINODE_STATUS=$(linode-cli linodes view "$LINODE_ID" --json 2>/dev/null \
+            | jq -r '.[0].status' || true)
+
+          # Check if K8s node is NotReady (VM may be running but kubelet dead)
+          K8S_READY=$(jq -r --arg n "$NODE_NAME" \
+            '.items[] | select(.metadata.name==$n) | .status.conditions[] | select(.type=="Ready") | .status' \
+            /tmp/nodes.json 2>/dev/null || true)
+
+          if [ "$LINODE_STATUS" = "offline" ] || [ "$K8S_READY" != "True" ]; then
+            echo "INFO: node $NODE_NAME is degraded (linode=$LINODE_STATUS, k8s_ready=$K8S_READY) -- cycling"
+            label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
+            cordon_node "$NODE_NAME"
+
+            # Shut down first if the Linode is still running
+            if [ "$LINODE_STATUS" != "offline" ]; then
+              echo "INFO: shutting down Linode $LINODE_ID before boot"
+              linode-cli linodes shutdown "$LINODE_ID" >/dev/null
+              wait_linode_offline "$LINODE_ID"
+            fi
+
+            linode-cli linodes boot "$LINODE_ID" >/dev/null
+            wait_node_ready "$NODE_NAME"
+            cleanup_stale_pods "$NODE_NAME"
+
+            label_node "$NODE_NAME" "vlan-ip" "$VLAN_IP_LABEL"
+            label_node "$NODE_NAME" "lke-vlan-controller-status" "completed"
+            uncordon_node "$NODE_NAME"
+            echo "INFO: node $NODE_NAME booted and active"
+          else
+            STILL_NEEDS_SHUTDOWN="$STILL_NEEDS_SHUTDOWN $ENTRY"
+          fi
+        done
+
+        # Phase B: shut down and boot healthy running nodes (requires healthy cluster).
+        for ENTRY in $STILL_NEEDS_SHUTDOWN; do
+          NODE_NAME=$(echo "$ENTRY"     | cut -d: -f1)
+          LINODE_ID=$(echo "$ENTRY"     | cut -d: -f2)
+          VLAN_IP_LABEL=$(echo "$ENTRY" | cut -d: -f3)
+
+          if ! cluster_all_ready; then
+            echo "WARN: cluster has NotReady or Cordoned nodes -- deferring shutdown of $NODE_NAME"
+            continue
+          fi
+
+          echo "INFO: shutting down and booting node $NODE_NAME (Linode $LINODE_ID)"
+          label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
+          cordon_node "$NODE_NAME"
+          if [ "$DRAIN_ENABLED" = "true" ]; then
+            drain_node "$NODE_NAME"
+          fi
+
+          linode-cli linodes shutdown "$LINODE_ID" >/dev/null
+          wait_linode_offline "$LINODE_ID"
+
+          linode-cli linodes boot "$LINODE_ID" >/dev/null
+          wait_node_not_ready "$NODE_NAME"
+          wait_node_ready "$NODE_NAME"
+          cleanup_stale_pods "$NODE_NAME"
+
+          label_node "$NODE_NAME" "vlan-ip" "$VLAN_IP_LABEL"
+          label_node "$NODE_NAME" "lke-vlan-controller-status" "completed"
+          uncordon_node "$NODE_NAME"
+          echo "INFO: node $NODE_NAME booted and active"
+        done
+
+        if [ -n "$MY_NODE_ENTRY" ]; then
+          NODE_NAME=$(echo "$MY_NODE_ENTRY"     | cut -d: -f1)
+          LINODE_ID=$(echo "$MY_NODE_ENTRY"     | cut -d: -f2)
+
+          echo "INFO: all other nodes done -- cordoning $NODE_NAME and migrating self"
+          label_node "$NODE_NAME" "lke-vlan-controller-status" "pending_reboot"
+          cordon_node "$NODE_NAME"
+          if [ "$DRAIN_ENABLED" = "true" ]; then
+            drain_node "$NODE_NAME"
+          fi
+          evict_self
+        fi
+      fi
+
+      renew_lease
+      sleep_renewing 60
+    done

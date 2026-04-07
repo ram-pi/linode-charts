@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lke-vlan-controller.fullname" . }}
+  labels:
+    {{- include "lke-vlan-controller.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Leader election via a Kubernetes Lease ensures only one pod runs the
+  # reconciliation loop at a time regardless of replica count.  Extra replicas
+  # wait on standby and take over automatically if the leader crashes.
+  replicas: {{ .Values.deployment.replicas }}
+  selector:
+    matchLabels:
+      {{- include "lke-vlan-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-vlan-controller.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lke-vlan-controller.serviceAccountName" . }}
+      priorityClassName: system-cluster-critical
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "lke-vlan-controller.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "lke-vlan-controller.fullname" . }}-scripts
+            defaultMode: 0555
+      containers:
+        - name: controller
+          image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+          imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          # Install runtime dependencies then run the controller loop.
+          # linode-cli is installed in a Python virtual environment (Alpine 3.21+ blocks system pip).
+          # linode-cli is configured via LINODE_CLI_TOKEN (no config file needed).
+          command: ["/bin/sh", "-c"]
+          args:
+            - "apk add --no-cache python3 py3-pip curl jq nmap coreutils >/dev/null 2>&1 && python3 -m venv /opt/venv && . /opt/venv/bin/activate && pip install linode-cli >/dev/null 2>&1 && /scripts/register.sh"
+          env:
+            - name: LINODE_CLI_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lke-vlan-controller.secretName" . }}
+                  key: {{ .Values.secretKey }}
+            - name: VLAN_NAME
+              value: {{ .Values.vlan.name | quote }}
+            - name: VLAN_CIDR
+              value: {{ .Values.vlan.cidr | quote }}
+            - name: BOOT_ENABLED
+              value: {{ .Values.boot.enabled | quote }}
+            - name: BOOT_TIMEOUT
+              value: {{ .Values.boot.waitTimeoutSeconds | quote }}
+            - name: DRAIN_ENABLED
+              value: {{ .Values.boot.drain.enabled | quote }}
+            - name: DRAIN_TIMEOUT
+              value: {{ .Values.boot.drain.timeoutSeconds | quote }}
+            - name: MY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MY_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: EXCLUDE_LABEL_KEY
+              value: {{ .Values.exclusion.labelKey | quote }}
+            - name: EXCLUDED_IPS
+              value: {{ join " " .Values.vlan.excludedIPs | quote }}
+            - name: LEASE_NAME
+              value: {{ include "lke-vlan-controller.fullname" . }}-leader
+            - name: LEASE_DURATION_SECONDS
+              value: {{ .Values.leaderElection.leaseDurationSeconds | quote }}
+            - name: RENEW_INTERVAL_SECONDS
+              value: {{ .Values.leaderElection.renewIntervalSeconds | quote }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - find /tmp/healthy -mmin -5 2>/dev/null | grep -q .
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}

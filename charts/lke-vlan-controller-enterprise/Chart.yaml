@@ -1,0 +1,20 @@
+apiVersion: v2
+name: lke-vlan-controller-enterprise
+description: >
+  Assigns VLAN interfaces to LKE Enterprise nodes and manages rolling reboots.
+  Handles LKE Enterprise VPC interface requirements: shuts down the Linode
+  before config-update (required when VPC interface is active) and preserves
+  the Linode Network Helper so DHCP/IPv6 SLAAC and VLAN configuration remain
+  functional after reboot.
+type: application
+version: 0.2.1
+appVersion: "1.0.0"
+keywords:
+  - linode
+  - vlan
+  - lke
+  - networking
+sources:
+  - https://github.com/ram-pi/linode-charts
+maintainers:
+  - name: ram-pi

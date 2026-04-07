@@ -8,6 +8,7 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 |---|---|---|
 | [lke-firewall-updater](charts/lke-firewall-updater/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-firewall-updater/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-firewall-updater) | Keeps cloud firewall rules in sync with Kubernetes node public IPs — supports Linode Cloud Firewalls, AWS Security Groups, and GCP VPC Firewall Rules simultaneously; event-driven single-writer controller with leader election eliminates concurrent-write race conditions |
 | [lke-vlan-controller](charts/lke-vlan-controller/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller) | Attaches a VLAN interface to every node in a standard LKE cluster with rolling reboots and IPAM |
+| [lke-vlan-controller-enterprise](charts/lke-vlan-controller-enterprise/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller-enterprise/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller-enterprise) | Variant of lke-vlan-controller for LKE Enterprise clusters (VPC/NAT 1:1). Preserves the Linode Network Helper and ensures IPv6 SLAAC and routable IPv6 when attaching VLAN interfaces. |
 | [lke-route-injector](charts/lke-route-injector/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-route-injector/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-route-injector) | Injects static IP routes on targeted LKE nodes via a DaemonSet — routes survive reboots and are re-applied on a configurable interval |
 
 ## Install from GHCR
@@ -28,6 +29,13 @@ helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater 
 ```bash
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller \
   --version 0.2.0 --namespace lke-vlan-controller --create-namespace \
+  --set vlan.name=my-vlan --set vlan.cidr=172.20.200.0/24 --set linodeToken=<TOKEN>
+```
+
+### lke-vlan-controller-enterprise
+```bash
+helm upgrade --install lke-vlan-controller-enterprise oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
+  --version 0.2.1 --namespace lke-vlan-controller --create-namespace \
   --set vlan.name=my-vlan --set vlan.cidr=172.20.200.0/24 --set linodeToken=<TOKEN>
 ```
 
