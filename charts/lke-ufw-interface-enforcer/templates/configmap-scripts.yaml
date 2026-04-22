@@ -1,0 +1,121 @@
+{{- if not .Values.target.interface }}
+{{- fail "lke-ufw-interface-enforcer: target.interface is required" }}
+{{- end }}
+{{- range $idx, $rule := .Values.policy.inboundRules }}
+{{- if not $rule.port }}
+{{- fail (printf "lke-ufw-interface-enforcer: policy.inboundRules[%d].port is required" $idx) }}
+{{- end }}
+{{- $rproto := lower (default "" $rule.protocol) }}
+{{- if and (ne $rproto "tcp") (ne $rproto "udp") }}
+{{- fail (printf "lke-ufw-interface-enforcer: policy.inboundRules[%d].protocol must be tcp or udp" $idx) }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lke-ufw-interface-enforcer.fullname" . }}-scripts
+  labels:
+    {{- include "lke-ufw-interface-enforcer.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  enforce-ufw.sh: |
+    #!/bin/sh
+    # Enforces interface-scoped UFW policy in the host namespace.
+    set -eu
+
+    host_exec() {
+      nsenter --target 1 --mount --uts --ipc --net --pid -- "$@"
+    }
+
+    detect_target_interface() {
+      if [ -n "${TARGET_INTERFACE}" ]; then
+        if host_exec ip link show dev "${TARGET_INTERFACE}" >/dev/null 2>&1; then
+          printf "%s" "${TARGET_INTERFACE}"
+          return 0
+        fi
+        echo "ERROR: target.interface ${TARGET_INTERFACE} does not exist on host" >&2
+        return 1
+      fi
+
+      echo "ERROR: TARGET_INTERFACE is required" >&2
+      return 1
+    }
+
+    apply_policy() {
+      host_exec env \
+        TARGET_IF="$1" \
+        INBOUND_RULES="${INBOUND_RULES}" \
+        sh -eu -c '
+          if ! command -v ufw >/dev/null 2>&1; then
+            if ! command -v apt-get >/dev/null 2>&1; then
+              echo "ERROR: ufw is not installed on host and apt-get is unavailable" >&2
+              exit 1
+            fi
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+          fi
+
+          # Set permissive global defaults BEFORE enabling UFW.
+          # Without this, ufw --force enable applies default deny-incoming to
+          # ALL interfaces (including the kubelet NIC on 10250), breaking
+          # kubectl logs and kubectl exec on every node.
+          # Our intent is to restrict ONLY the target interface; all other
+          # interfaces must remain open.
+          ufw default allow incoming
+          ufw default allow outgoing
+          ufw --force enable
+
+          # Remove previously applied rules for this enforcer.
+          # ufw status numbered formats rule numbers as "[ 1]", so $1="[" and $2="1]".
+          # Adding as integer: $1+0=0, $2+0=1 (awk drops trailing "]"). Fall back to $2.
+          ufw status numbered | awk "/lke-ufw-(vlan|interface)-enforcer/ {n=\$1+0; if (n==0) n=\$2+0; if (n>0) print n}" | sort -rn | while read -r rule_no; do
+            ufw --force delete "$rule_no"
+          done || true
+
+          ufw allow out on "$TARGET_IF" comment "lke-ufw-interface-enforcer"
+
+          # Apply interface-scoped inbound allow rules, then deny everything else
+          # on this interface. UFW handles ESTABLISHED/RELATED via conntrack automatically.
+          if [ -n "$INBOUND_RULES" ]; then
+            oldifs="$IFS"
+            IFS=","
+            for rule in $INBOUND_RULES; do
+              [ -z "$rule" ] && continue
+              proto=$(printf "%s" "$rule" | cut -d: -f1)
+              port=$(printf "%s" "$rule" | cut -d: -f2-)
+              [ -z "$proto" ] && continue
+              [ -z "$port" ] && continue
+              ufw allow in on "$TARGET_IF" to any port "$port" proto "$proto" comment "lke-ufw-interface-enforcer"
+            done
+            IFS="$oldifs"
+          fi
+
+          ufw deny in on "$TARGET_IF" comment "lke-ufw-interface-enforcer"
+
+          echo "--- UFW rules after enforcement ---"
+          ufw status numbered
+        '
+    }
+
+    TARGET_INTERFACE="{{ .Values.target.interface }}"
+    INBOUND_RULES="{{- range $i, $r := .Values.policy.inboundRules }}{{- if $i }},{{ end -}}{{ lower $r.protocol }}:{{ $r.port }}{{- end }}"
+
+    echo "INFO: lke-ufw-interface-enforcer started (target.interface=${TARGET_INTERFACE}, inbound_rules=${INBOUND_RULES})"
+
+    while true; do
+      iface="$(detect_target_interface || true)"
+      if [ -z "$iface" ]; then
+        echo "WARN: unable to resolve target interface (target.interface=${TARGET_INTERFACE}); retrying"
+      else
+        if apply_policy "$iface"; then
+          echo "INFO: enforced UFW policy on interface ${iface}"
+          touch /tmp/healthy
+        else
+          echo "WARN: failed to enforce UFW policy on interface ${iface}"
+        fi
+      fi
+      sleep {{ .Values.interval }}
+    done

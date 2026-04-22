@@ -1,0 +1,61 @@
+# -- Target interface selection.
+# Policy is enforced on this interface directly (for example "eth2").
+target:
+  interface: "eth1"
+
+# -- Interface-scoped policy configuration.
+policy:
+  # -- Inbound allow-list on the target interface.
+  # Only these port/protocol rules are allowed inbound on that interface.
+  # Everything else inbound on that interface is denied.
+  #
+  # port may be a single port ("443") or range ("20000:20100").
+  # protocol supports: tcp, udp
+  inboundRules: []
+  # Example:
+  # inboundRules:
+  #   - port: "22"
+  #     protocol: tcp
+  #   - port: "443"
+  #     protocol: tcp
+
+  # -- Seconds between enforcement loops.
+interval: 60
+
+namespace:
+  # -- Create the namespace as part of this Helm release.
+  create: true
+
+deployment:
+  image:
+    repository: alpine
+    tag: "3.21.3"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "20m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  # -- Node selector for the DaemonSet pods. By default this targets nodes
+  # already processed by lke-vlan-controller.
+  nodeSelector:
+    lke-vlan-controller-status: completed
+  # -- Tolerations for the DaemonSet pod.
+  tolerations: []
+
+serviceAccount:
+  # -- If true, create a ServiceAccount. Set to false to bring your own.
+  create: true
+  # -- Name override. Defaults to the chart fullname.
+  name: ""
+  annotations: {}
+
+# -- Labels added to all resources.
+commonLabels: {}
+# -- Annotations added to all resources.
+commonAnnotations: {}
+
+nameOverride: ""
+fullnameOverride: ""

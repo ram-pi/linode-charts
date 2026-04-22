@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "lke-ufw-interface-enforcer.fullname" . }}
+  labels:
+    {{- include "lke-ufw-interface-enforcer.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lke-ufw-interface-enforcer.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-ufw-interface-enforcer.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lke-ufw-interface-enforcer.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 5
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "lke-ufw-interface-enforcer.fullname" . }}-scripts
+            defaultMode: 0555
+      containers:
+        - name: ufw-vlan-enforcer
+          image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+          imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - "apk add --no-cache util-linux >/dev/null 2>&1 && /scripts/enforce-ufw.sh"
+          securityContext:
+            privileged: true
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - find /tmp/healthy -mmin -5 2>/dev/null | grep -q .
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}

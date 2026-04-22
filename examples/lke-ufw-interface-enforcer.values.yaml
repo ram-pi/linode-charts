@@ -1,0 +1,23 @@
+# Example values for lke-ufw-interface-enforcer (baseline interface policy)
+# Usage:
+# helm upgrade --install lke-ufw-interface-enforcer charts/lke-ufw-interface-enforcer \
+#   --namespace lke-ufw-interface-enforcer --create-namespace \
+#   -f examples/lke-ufw-interface-enforcer.values.yaml
+
+target:
+  # Verify this interface in Linode Cloud Manager node Configuration before install.
+  interface: "eth1"
+
+policy:
+  inboundRules:
+    # - port: "22"
+    #   protocol: tcp
+    - port: "30080"
+      protocol: tcp
+
+interval: 60
+
+deployment:
+  nodeSelector:
+    lke-vlan-controller-status: completed
+  tolerations: []

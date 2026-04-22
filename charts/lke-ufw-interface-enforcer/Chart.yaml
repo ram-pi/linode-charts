@@ -1,0 +1,20 @@
+apiVersion: v2
+name: lke-ufw-interface-enforcer
+description: >
+  Enforces interface-scoped UFW policy on targeted LKE nodes via a DaemonSet.
+  Uses explicit interface targeting, allows selected inbound ports on that
+  interface, and allows all outbound traffic.
+type: application
+version: 0.3.0
+appVersion: "1.0.0"
+keywords:
+  - linode
+  - lke
+  - ufw
+  - firewall
+  - interface
+  - networking
+sources:
+  - https://github.com/ram-pi/linode-charts
+maintainers:
+  - name: ram-pi
