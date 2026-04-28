@@ -2,7 +2,7 @@
 
 Variant of [lke-vlan-controller](../lke-vlan-controller/) designed for **LKE Enterprise** clusters, which use VPC-based networking instead of direct public interfaces.
 
-- **Deployment** — single replica serialises VLAN attachment so only one node is processed at a time (preventing IP collisions)
+- **Deployment** — multiple replicas are supported for hot-standby failover, but leader election still serialises VLAN attachment so only one pod actively processes nodes at a time
 - **Shutdown-before-update** — shuts the Linode down before calling `config-update`, required on LKE Enterprise because the VPC interface is always active
 - **Network Helper preserved** — the controller preserves the Linode Network Helper and ensures IPv6 SLAAC and VLAN configuration remain functional. The controller may set `ipv6.is_public = true` for the VPC interface when necessary to retain routable IPv6 addresses used by the kubelet and control-plane reachability.
 - **Rolling reboot** — uses `linode-cli linodes boot` (not `reboot`) since the node is already offline; waits until the node shows `Ready=true` before touching the next node
@@ -59,7 +59,7 @@ kubectl create secret generic linode-token \
   --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
-  --version 0.1.0 \
+  --version 0.2.2 \
   --namespace lke-vlan-controller \
   --create-namespace \
   --set vlan.name=<VLAN_LABEL> \
@@ -76,16 +76,27 @@ helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-control
 |---|---|---|
 | `vlan.name` | **Required.** VLAN label to attach | `""` |
 | `vlan.cidr` | **Required.** CIDR to allocate IPs from | `""` |
+| `vlan.excludedIPs` | IPs within the CIDR that the controller must never assign | `[]` |
 | `linodeToken` | Inline Linode API token; mutually exclusive with `existingSecret` | `""` |
 | `existingSecret` | Name of a pre-existing Secret that holds the token | `""` |
 | `secretKey` | Key within the Secret that stores the token | `token` |
+| `deployment.replicas` | Number of controller replicas; only the leader is active | `2` |
 | `deployment.image` | Controller image repository/tag/pull policy | `alpine:3.21.3`, `IfNotPresent` |
 | `deployment.resources` | Resource requests/limits for the controller pod | `cpu: 50m / 200m`, `memory: 64Mi / 128Mi` |
 | `deployment.nodeSelector` | Node selector for the controller pod | `{}` |
 | `deployment.tolerations` | Tolerations for the controller pod | `[]` |
-| `reboot.enabled` | Boot each Linode after VLAN attachment | `true` |
-| `reboot.waitTimeoutSeconds` | Seconds to wait for the node to return to Ready after boot | `600` |
+| `boot.enabled` | Boot each Linode after VLAN attachment | `true` |
+| `boot.waitTimeoutSeconds` | Seconds to wait for the node to return to Ready after boot | `600` |
+| `boot.drain.enabled` | Evict non-DaemonSet pods before shutdown | `true` |
+| `boot.drain.timeoutSeconds` | Seconds to wait for drain completion before proceeding | `120` |
+| `exclusion.labelKey` | Label key that marks a node as excluded from VLAN assignment; set to `""` to disable | `lke-vlan-exclude` |
 | `serviceAccount.create` | Create a ServiceAccount for the controller | `true` |
+| `leaderElection.leaseDurationSeconds` | Seconds a Lease is valid without renewal; standby takes over after expiry | `30` |
+| `leaderElection.renewIntervalSeconds` | How often the leader renews the Lease | `10` |
+| `commonLabels` | Labels added to all resources | `{}` |
+| `commonAnnotations` | Annotations added to all resources | `{}` |
+
+When `deployment.replicas > 1`, the chart also renders a PodDisruptionBudget with `minAvailable: 1`. Single-replica installs intentionally omit the PDB so voluntary disruptions remain possible during maintenance.
 
 ---
 
@@ -104,6 +115,8 @@ helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-control
    - loops every 60 seconds, re-checking until every node has the interface
 
 All API calls use `linode-cli` with the token supplied via a Kubernetes Secret; the controller adds the VLAN interface only once per node.
+
+The chart renders a PodDisruptionBudget only when `deployment.replicas > 1`. This keeps voluntary disruptions possible for intentionally single-replica installs while still protecting HA standby deployments.
 
 ---
 

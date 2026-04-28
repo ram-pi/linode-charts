@@ -119,10 +119,12 @@ kubectl logs -n lke-vlan-controller <pod-name> -f
 | `reboot.waitTimeoutSeconds` | Seconds to wait for the node to return to Ready after reboot | `600` |
 | `exclusion.labelKey` | Label key that marks a node as excluded from VLAN assignment; any non-empty value skips the node; set to `""` to disable | `lke-vlan-exclude` |
 | `serviceAccount.create` | Create a ServiceAccount for the controller | `true` |
-| `leaderElection.leaseDurationSeconds` | Seconds a Lease is valid without renewal; standby takes over after expiry | `15` |
-| `leaderElection.renewIntervalSeconds` | How often the leader renews the Lease | `5` |
+| `leaderElection.leaseDurationSeconds` | Seconds a Lease is valid without renewal; standby takes over after expiry | `30` |
+| `leaderElection.renewIntervalSeconds` | How often the leader renews the Lease | `10` |
 | `commonLabels` | Labels added to all resources | `{}` |
 | `commonAnnotations` | Annotations added to all resources | `{}` |
+
+When `deployment.replicas > 1`, the chart also renders a PodDisruptionBudget with `minAvailable: 1`. Single-replica installs intentionally omit the PDB so voluntary disruptions do not block node drains or upgrades.
 
 ---
 
@@ -160,6 +162,8 @@ The label value is not significant — any non-empty value causes the node to be
    - sets the `vlan-ip` label only after the node is back to Ready — this is the stateless completion marker
 6. **Deadlock prevention** – the controller's own node is always rebooted last. By the time the pod migrates, all other nodes are Ready and uncordoned.
 7. **Lease renewal** – `renew_lease` is called inside every poll loop iteration so the Lease stays alive during long reboot waits. During idle sleep periods between reconcile loops, the leader uses `sleep_renewing` (chunked sleep with renewal every `renewIntervalSeconds`) so the Lease never lapses while the cluster is fully configured.
+
+The chart renders a PodDisruptionBudget only when `deployment.replicas > 1`. This preserves disruption protection for HA installs while avoiding `minAvailable: 1` blocking behavior when operators intentionally run a single controller replica.
 
 ---
 

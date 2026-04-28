@@ -47,6 +47,11 @@ data:
     EXCLUDED_IPS="${EXCLUDED_IPS:-}"
     DRAIN_ENABLED="${DRAIN_ENABLED:-true}"
     DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
+    VLAN_PREFIX="${VLAN_CIDR#*/}"
+    if [ -z "$VLAN_PREFIX" ] || [ "$VLAN_PREFIX" = "$VLAN_CIDR" ]; then
+      echo "ERROR: VLAN_CIDR must include a prefix length (for example 172.30.0.0/23)"
+      exit 1
+    fi
 
     # Activate Python virtual environment where linode-cli is installed
     . /opt/venv/bin/activate
@@ -593,7 +598,7 @@ data:
             echo "ERROR: CIDR $VLAN_CIDR is exhausted -- no free IPs"
             break
           fi
-          IPAM="${NEW_IP}/24"
+          IPAM="${NEW_IP}/${VLAN_PREFIX}"
           echo "INFO: assigning $IPAM to node $NODE_NAME (Linode $LINODE_ID)"
           echo "$NEW_IP" >> "$USED_IPS_FILE"
 
