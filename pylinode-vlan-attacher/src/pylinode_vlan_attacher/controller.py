@@ -250,11 +250,25 @@ class VLANAttacherController:
             used_ips.add(next_ip)
             ipam = f"{next_ip}/{prefix}"
 
+            linode_status = self.linode.status(linode_id)
+            if linode_status in {"booting", "running"} and not self._is_node_ready(node_name):
+                LOGGER.info(
+                    "recovery mode: node=%s linode=%s status=%s, waiting for node readiness before forcing shutdown",
+                    node_name,
+                    linode_id,
+                    linode_status,
+                )
+                self._wait_node_ready(node_name, timeout_seconds=300)
+                return True
+
             LOGGER.info("recovery mode: resuming attach for node=%s ipam=%s", node_name, ipam)
             self._cordon(node_name, True)
             payload = self._build_updated_config(config_data, ipam)
-            self.linode.shutdown(linode_id)
-            self._wait_linode_status(linode_id, "offline", timeout_seconds=300)
+            if linode_status == "shutting_down":
+                self._wait_linode_status(linode_id, "offline", timeout_seconds=300)
+            elif linode_status != "offline":
+                self.linode.shutdown(linode_id)
+                self._wait_linode_status(linode_id, "offline", timeout_seconds=300)
             self.linode.config_update(linode_id, config_id, payload)
             self.linode.boot(linode_id)
             self._wait_node_not_ready(node_name, timeout_seconds=180)
