@@ -1,0 +1,19 @@
+apiVersion: v2
+name: universal-lke-vlan-controller
+description: >
+  Python-based VLAN attacher for LKE standard and Enterprise nodes.
+  Uses Kubernetes Lease leader election for active/standby operation and
+  performs rolling shutdown -> config-update -> boot sequencing.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - linode
+  - vlan
+  - lke
+  - networking
+  - python
+sources:
+  - https://github.com/ram-pi/linode-charts
+maintainers:
+  - name: ram-pi

@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lke-vlan-controller-python.fullname" . }}
+  labels:
+    {{- include "lke-vlan-controller-python.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.deployment.replicas }}
+  selector:
+    matchLabels:
+      {{- include "lke-vlan-controller-python.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-vlan-controller-python.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lke-vlan-controller-python.serviceAccountName" . }}
+      priorityClassName: system-cluster-critical
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "lke-vlan-controller-python.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: controller
+          image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+          imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          env:
+            - name: LINODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lke-vlan-controller-python.secretName" . }}
+                  key: {{ .Values.secretKey }}
+            - name: VLAN_NAME
+              value: {{ .Values.vlan.name | quote }}
+            - name: VLAN_CIDR
+              value: {{ .Values.vlan.cidr | quote }}
+            - name: EXCLUDED_IPS
+              value: {{ join " " .Values.vlan.excludedIPs | quote }}
+            - name: MY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MY_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: LEASE_NAME
+              value: {{ include "lke-vlan-controller-python.fullname" . }}-leader
+            - name: LEASE_DURATION_SECONDS
+              value: {{ .Values.leaderElection.leaseDurationSeconds | quote }}
+            - name: RENEW_INTERVAL_SECONDS
+              value: {{ .Values.leaderElection.renewIntervalSeconds | quote }}
+            - name: POLL_INTERVAL_SECONDS
+              value: {{ .Values.controller.pollIntervalSeconds | quote }}
+            - name: NODE_SELECTOR
+              value: {{ include "lke-vlan-controller-python.nodeSelectorEnv" . | quote }}
+            - name: APPLY_CHANGES
+              value: {{ .Values.controller.applyChanges | quote }}
+            - name: CREATE_NAMESPACE_IF_MISSING
+              value: {{ .Values.controller.createNamespaceIfMissing | quote }}
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}

@@ -1,0 +1,28 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "lke-vlan-controller-python.fullname" . }}
+  labels:
+    {{- include "lke-vlan-controller-python.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+
+{{- if .Values.controller.createNamespaceIfMissing }}
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create"]
+{{- end }}
