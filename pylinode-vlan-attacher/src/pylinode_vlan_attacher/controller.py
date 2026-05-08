@@ -88,6 +88,17 @@ class VLANAttacherController:
         try:
             self.core.read_namespace(self.cfg.namespace)
         except ApiException as exc:
+            if exc.status == 403:
+                if self.cfg.create_namespace_if_missing:
+                    raise RuntimeError(
+                        "CREATE_NAMESPACE_IF_MISSING=true but ServiceAccount lacks permissions "
+                        f"to get/create namespace '{self.cfg.namespace}'."
+                    ) from exc
+                LOGGER.info(
+                    "namespace read forbidden for %s; continuing because runtime namespace creation is disabled",
+                    self.cfg.namespace,
+                )
+                return
             if exc.status == 404:
                 if self.cfg.create_namespace_if_missing:
                     LOGGER.info("namespace %s not found, creating it", self.cfg.namespace)
