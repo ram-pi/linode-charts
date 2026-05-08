@@ -1,0 +1,77 @@
+# -- VLAN configuration.
+vlan:
+  # -- REQUIRED. VLAN label as it appears in the Linode account (e.g. "my-private-vlan").
+  name: ""
+  # -- REQUIRED. CIDR block to allocate addresses from (e.g. "192.168.128.0/17").
+  cidr: ""
+  # -- List of IPs within the CIDR that the controller must never assign.
+  excludedIPs: []
+
+# -- Linode API token with Linodes Read/Write scope.
+# Mutually exclusive with existingSecret — set exactly one.
+linodeToken: ""
+
+# -- Name of a pre-existing Kubernetes Secret whose key holds the Linode API token.
+# When set, linodeToken is ignored and no Secret resource is created.
+existingSecret: ""
+
+# -- Key within the Secret that holds the token value.
+secretKey: "token"
+
+namespace:
+  # -- Create the namespace as part of this Helm release.
+  # Set to false if you manage namespaces externally (e.g. via GitOps).
+  create: true
+
+deployment:
+  # Number of controller replicas. Only one pod runs the reconciliation loop
+  # at a time; extra replicas are hot standbys.
+  replicas: 2
+  image:
+    repository: ghcr.io/ram-pi/pylinode-vlan-attacher
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+  # -- Node selector applied to the controller pod.
+  nodeSelector: {}
+  # -- Tolerations for the controller pod.
+  tolerations: []
+
+controller:
+  # -- If true, allow mutating node/Linode state. Set false for observe-only mode.
+  applyChanges: true
+  # -- If true, controller creates MY_NAMESPACE when missing.
+  # Usually not needed when namespace.create=true in this chart.
+  createNamespaceIfMissing: false
+  # -- Reconcile interval in seconds.
+  pollIntervalSeconds: 60
+  # -- Optional node label selector for target nodes only.
+  # Format is a map rendered to "key=value,key2=value2".
+  nodeSelector: {}
+
+serviceAccount:
+  # -- If true, create a ServiceAccount. Set to false to bring your own.
+  create: true
+  # -- Name override. Defaults to the chart fullname.
+  name: ""
+  annotations: {}
+
+# -- Labels added to all resources.
+commonLabels: {}
+# -- Annotations added to all resources.
+commonAnnotations: {}
+
+leaderElection:
+  # Seconds a Lease is valid without renewal. After expiry a standby pod takes over.
+  leaseDurationSeconds: 30
+  # How often standby checks/acquisition retries and leader renews Lease.
+  renewIntervalSeconds: 10
+
+nameOverride: ""
+fullnameOverride: ""

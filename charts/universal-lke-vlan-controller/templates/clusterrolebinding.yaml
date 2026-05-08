@@ -1,0 +1,18 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "lke-vlan-controller-python.fullname" . }}
+  labels:
+    {{- include "lke-vlan-controller-python.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "lke-vlan-controller-python.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "lke-vlan-controller-python.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
