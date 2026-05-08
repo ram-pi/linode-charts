@@ -1,0 +1,17 @@
+[project]
+name = "pylinode-vlan-attacher"
+version = "0.1.0"
+description = "Leader-elected VLAN attacher for LKE Enterprise nodes"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "kubernetes>=35.0.0",
+    "linode-api4>=5.43.0",
+]
+
+[project.scripts]
+pylinode-vlan-attacher = "pylinode_vlan_attacher.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
