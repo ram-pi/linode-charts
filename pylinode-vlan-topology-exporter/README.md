@@ -177,3 +177,5 @@ It includes:
 - filtered tables for VLAN counts and topology (without `job`/`instance` columns)
 - growth timeseries (`Linodes in VLANs Over Time`)
 - API pressure timeseries (`Linode API Rate-Limit Hit Rate`)
+
+![alt text](image.png)

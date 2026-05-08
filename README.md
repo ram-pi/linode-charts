@@ -10,6 +10,7 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 | [lke-vlan-controller](charts/lke-vlan-controller/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller) | Attaches a VLAN interface to every node in a standard LKE cluster with rolling reboots and IPAM |
 | [lke-vlan-controller-enterprise](charts/lke-vlan-controller-enterprise/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-vlan-controller-enterprise/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-vlan-controller-enterprise) | Variant of lke-vlan-controller for LKE Enterprise clusters (VPC/NAT 1:1). Preserves the Linode Network Helper and ensures IPv6 SLAAC and routable IPv6 when attaching VLAN interfaces. |
 | [universal-lke-vlan-controller](charts/universal-lke-vlan-controller/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/universal-lke-vlan-controller/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/universal-lke-vlan-controller) | Python-based universal VLAN controller for both standard and Enterprise LKE clusters with Lease leader election, rolling node updates, and label-driven recovery |
+| [linode-vlan-topology-exporter](charts/linode-vlan-topology-exporter/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/linode-vlan-topology-exporter/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/linode-vlan-topology-exporter) | Prometheus exporter that discovers Linode VLAN topology (legacy config + new Linode interfaces) and exposes metrics for Grafana dashboards |
 | [lke-route-injector](charts/lke-route-injector/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-route-injector/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-route-injector) | Injects static IP routes on targeted LKE nodes via a DaemonSet — routes survive reboots and are re-applied on a configurable interval |
 | [lke-ufw-interface-enforcer](charts/lke-ufw-interface-enforcer/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-ufw-interface-enforcer/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-ufw-interface-enforcer) | Enforces interface-scoped UFW policy on targeted LKE nodes using explicit interface targeting (for example eth2), allows selected inbound ports, and keeps outbound traffic allowed |
 
@@ -49,6 +50,14 @@ helm upgrade --install universal-lke-vlan-controller oci://ghcr.io/ram-pi/univer
   --set 'vlan.excludedIPs={172.16.1.1,172.16.1.2}' \
   --set 'controller.nodeSelector.vlan=enabled' \
   --set existingSecret=linode-token
+```
+
+### linode-vlan-topology-exporter
+```bash
+helm upgrade --install linode-vlan-topology-exporter oci://ghcr.io/ram-pi/linode-vlan-topology-exporter \
+  --version 0.1.0 --namespace linode-vlan-topology-exporter --create-namespace \
+  --set existingSecret=linode-token \
+  --set service.type=LoadBalancer
 ```
 
 ### lke-route-injector

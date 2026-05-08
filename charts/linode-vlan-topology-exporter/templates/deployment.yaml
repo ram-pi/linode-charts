@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "linode-vlan-topology-exporter.fullname" . }}
+  labels:
+    {{- include "linode-vlan-topology-exporter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.deployment.replicas }}
+  selector:
+    matchLabels:
+      {{- include "linode-vlan-topology-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "linode-vlan-topology-exporter.selectorLabels" . | nindent 8 }}
+      {{- with .Values.commonAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "linode-vlan-topology-exporter.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: exporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: LINODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "linode-vlan-topology-exporter.secretName" . }}
+                  key: {{ .Values.secretKey }}
+            - name: SCRAPE_INTERVAL_SECONDS
+              value: {{ .Values.exporter.scrapeIntervalSeconds | quote }}
+            - name: MAX_WORKERS
+              value: {{ .Values.exporter.maxWorkers | quote }}
+            - name: MAX_RPS
+              value: {{ .Values.exporter.maxRps | quote }}
+            - name: METRICS_PORT
+              value: {{ .Values.exporter.metricsPort | quote }}
+            - name: VLAN_LABEL_FILTER
+              value: {{ .Values.exporter.vlanLabelFilter | quote }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.exporter.metricsPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}
