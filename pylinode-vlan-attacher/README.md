@@ -25,8 +25,8 @@ Run with environment variables:
 ```bash
 export LINODE_TOKEN="<token>"
 export VLAN_NAME="my-private-vlan"
-export VLAN_CIDR="10.100.100.0/24"
-export EXCLUDED_IPS="10.100.100.1 10.100.100.2"
+export VLAN_CIDR="172.16.1.0/24"
+export EXCLUDED_IPS="172.16.1.1 172.16.1.2"
 export MY_NAMESPACE="lke-vlan-controller"
 # Optional; defaults to local-dev-<pid>
 export MY_POD_NAME="local-dev-1"
@@ -34,7 +34,9 @@ export LEASE_NAME="pylinode-vlan-attacher-leader"
 export LEASE_DURATION_SECONDS="30"
 export RENEW_INTERVAL_SECONDS="10"
 export POLL_INTERVAL_SECONDS="60"
+export NODE_SELECTOR="vlan=enabled"
 export APPLY_CHANGES="false"
+export CREATE_NAMESPACE_IF_MISSING="false"
 
 uv run pylinode-vlan-attacher
 ```
@@ -51,6 +53,10 @@ To simulate standby mode locally, open a second terminal with a different `MY_PO
 
 Image version is sourced from `pylinode-vlan-attacher/VERSION` in CI. The GitHub Actions workflow publishes both `:latest` and `:<VERSION>` tags to GHCR.
 
+Published package:
+- `ghcr.io/ram-pi/pylinode-vlan-attacher`
+- https://github.com/ram-pi/linode-charts/pkgs/container/pylinode-vlan-attacher
+
 Build image:
 
 ```bash
@@ -63,21 +69,45 @@ Run against local kubeconfig:
 docker run --rm -it \
   -e LINODE_TOKEN="<token>" \
   -e VLAN_NAME="my-private-vlan" \
-  -e VLAN_CIDR="10.100.100.0/24" \
-  -e EXCLUDED_IPS="10.100.100.1 10.100.100.2" \
+  -e VLAN_CIDR="172.16.1.0/24" \
+  -e EXCLUDED_IPS="172.16.1.1 172.16.1.2" \
   -e MY_NAMESPACE="lke-vlan-controller" \
   -e MY_POD_NAME="docker-dev-1" \
   -e LEASE_NAME="pylinode-vlan-attacher-leader" \
   -e LEASE_DURATION_SECONDS="30" \
   -e RENEW_INTERVAL_SECONDS="10" \
   -e POLL_INTERVAL_SECONDS="60" \
+  -e NODE_SELECTOR="vlan=enabled" \
   -e APPLY_CHANGES="false" \
+  -e CREATE_NAMESPACE_IF_MISSING="false" \
   -e KUBECONFIG="/kube/config" \
   -v "$HOME/.kube/config:/kube/config:ro" \
   pylinode-vlan-attacher:dev
 ```
 
 To test standby with Docker, run a second container with another `MY_POD_NAME` (for example `docker-dev-2`).
+
+Run directly from GHCR (no local build):
+
+```bash
+docker run --rm -it \
+  -e LINODE_TOKEN="<token>" \
+  -e VLAN_NAME="my-private-vlan" \
+  -e VLAN_CIDR="172.16.1.0/24" \
+  -e EXCLUDED_IPS="172.16.1.1 172.16.1.2" \
+  -e MY_NAMESPACE="lke-vlan-controller" \
+  -e MY_POD_NAME="docker-ghcr-1" \
+  -e LEASE_NAME="pylinode-vlan-attacher-leader" \
+  -e LEASE_DURATION_SECONDS="30" \
+  -e RENEW_INTERVAL_SECONDS="10" \
+  -e POLL_INTERVAL_SECONDS="60" \
+  -e NODE_SELECTOR="vlan=enabled" \
+  -e APPLY_CHANGES="false" \
+  -e CREATE_NAMESPACE_IF_MISSING="false" \
+  -e KUBECONFIG="/kube/config" \
+  -v "$HOME/.kube/config:/kube/config:ro" \
+  ghcr.io/ram-pi/pylinode-vlan-attacher:latest
+```
 
 ## Rolling attach test
 
@@ -109,10 +139,24 @@ uv run pylinode-vlan-attacher
 kubectl get nodes --show-labels | grep vlan-ip
 ```
 
+5. Optional cleanup of reboot-generated failed pods (recommended during iterative tests):
+
+```bash
+# Capture state first (debug snapshot)
+kubectl get pods -A --field-selector=status.phase=Failed -o wide
+kubectl get events -A --sort-by=.lastTimestamp
+
+# Remove reboot leftovers
+kubectl delete pod -A --field-selector=status.phase=Failed
+```
+
+Failed/Error pod objects are commonly created during node reboot cycles. They often disappear later via normal controller/GC behavior, but not always quickly, so manual cleanup keeps test signal clear.
+
 ## Notes
 
 - IP allocation is first-free host order within `VLAN_CIDR`.
 - The allocator excludes IPs already used on the target VLAN and all IPs from `EXCLUDED_IPS`.
+- `NODE_SELECTOR` is optional and filters target nodes by labels (`key=value,key2=value2`).
 - `APPLY_CHANGES=false` is the default and runs observe-only mode (safe for local testing).
 - Set `APPLY_CHANGES=true` only when mutation steps are implemented and validated.
 - Current implementation supports rolling VLAN attachment with leader election.

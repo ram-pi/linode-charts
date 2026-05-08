@@ -89,9 +89,15 @@ class VLANAttacherController:
             self.core.read_namespace(self.cfg.namespace)
         except ApiException as exc:
             if exc.status == 404:
+                if self.cfg.create_namespace_if_missing:
+                    LOGGER.info("namespace %s not found, creating it", self.cfg.namespace)
+                    body = client.V1Namespace(metadata=client.V1ObjectMeta(name=self.cfg.namespace))
+                    self.core.create_namespace(body)
+                    return
                 raise RuntimeError(
                     f"Namespace '{self.cfg.namespace}' not found. "
-                    f"Create it first: kubectl create namespace {self.cfg.namespace}"
+                    f"Create it first: kubectl create namespace {self.cfg.namespace} "
+                    f"or set CREATE_NAMESPACE_IF_MISSING=true"
                 ) from exc
             raise
 
@@ -176,13 +182,14 @@ class VLANAttacherController:
             self._label_node(node_name, "lke-vlan-controller-status", "pending_reboot")
             self._cordon(node_name, True)
 
+            payload = self._build_updated_config(config_data, ipam)
+            LOGGER.info("node=%s using unified flow (shutdown -> update -> boot)", node_name)
             self.linode.shutdown(linode_id)
             self._wait_linode_status(linode_id, "offline", timeout_seconds=300)
-
-            payload = self._build_updated_config(config_data, ipam)
             self.linode.config_update(linode_id, config_id, payload)
-
             self.linode.boot(linode_id)
+
+            self._wait_node_not_ready(node_name, timeout_seconds=180)
             self._wait_node_ready(node_name, timeout_seconds=600)
 
             self._label_node(node_name, "vlan-ip", ipam.replace("/", "_"))
@@ -192,7 +199,23 @@ class VLANAttacherController:
 
     def _k8s_nodes(self) -> list[str]:
         data = self.core.list_node()
-        return [item.metadata.name for item in data.items if item.metadata and item.metadata.name]
+        selected: list[str] = []
+        for item in data.items:
+            if not item.metadata or not item.metadata.name:
+                continue
+            labels = item.metadata.labels or {}
+            if self.cfg.node_selector and not self._labels_match_selector(labels):
+                continue
+            selected.append(item.metadata.name)
+        if self.cfg.node_selector:
+            LOGGER.info("node selector=%s matched nodes=%s", self.cfg.node_selector, len(selected))
+        return selected
+
+    def _labels_match_selector(self, labels: dict[str, str]) -> bool:
+        for key, expected in self.cfg.node_selector.items():
+            if labels.get(key) != expected:
+                return False
+        return True
 
     def _vlan_linode_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -260,6 +283,21 @@ class VLANAttacherController:
             elapsed += interval
         raise TimeoutError(f"Node {node_name} did not become Ready within {timeout_seconds}s")
 
+    def _wait_node_not_ready(self, node_name: str, timeout_seconds: int) -> None:
+        elapsed = 0
+        interval = 10
+        while elapsed < timeout_seconds:
+            if self.stop_event.is_set():
+                raise RuntimeError("Shutdown requested while waiting for node NotReady")
+            if not self.lease.try_acquire_or_renew():
+                raise RuntimeError("Lost leader lease while waiting for node NotReady")
+            if not self._is_node_ready(node_name):
+                LOGGER.info("node=%s is NotReady", node_name)
+                return
+            time.sleep(interval)
+            elapsed += interval
+        LOGGER.warning("node=%s did not transition to NotReady within %ss", node_name, timeout_seconds)
+
     def _wait_linode_status(self, linode_id: int, desired_status: str, timeout_seconds: int) -> None:
         elapsed = 0
         interval = 10
@@ -318,6 +356,11 @@ class VLANAttacherController:
             if cleaned.get("purpose") == "vpc" and isinstance(cleaned.get("ipv6"), dict):
                 cleaned["ipv6"]["is_public"] = True
             interfaces.append(cleaned)
+
+        has_public = any(iface.get("purpose") == "public" for iface in interfaces)
+        has_vpc = any(iface.get("purpose") == "vpc" for iface in interfaces)
+        if not has_public and not has_vpc:
+            interfaces.insert(0, {"purpose": "public"})
 
         interfaces.append({"purpose": "vlan", "label": self.cfg.vlan_name, "ipam_address": ipam})
         return {

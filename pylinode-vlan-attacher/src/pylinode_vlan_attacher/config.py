@@ -39,6 +39,8 @@ class Config:
     poll_interval_seconds: int
     drain_enabled: bool
     apply_changes: bool
+    create_namespace_if_missing: bool
+    node_selector: dict[str, str]
     excluded_ips: list[str]
 
     @classmethod
@@ -56,5 +58,26 @@ class Config:
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "60")),
             drain_enabled=_as_bool(os.getenv("DRAIN_ENABLED", "true"), True),
             apply_changes=_as_bool(os.getenv("APPLY_CHANGES", "false"), False),
+            create_namespace_if_missing=_as_bool(os.getenv("CREATE_NAMESPACE_IF_MISSING", "false"), False),
+            node_selector=_as_str_dict(os.getenv("NODE_SELECTOR", "")),
             excluded_ips=_as_str_list(os.getenv("EXCLUDED_IPS", "")),
         )
+
+
+def _as_str_dict(value: str) -> dict[str, str]:
+    raw = value.strip()
+    if not raw:
+        return {}
+
+    result: dict[str, str] = {}
+    parts = [item.strip() for item in raw.split(",") if item.strip()]
+    for part in parts:
+        if "=" not in part:
+            raise ValueError(f"Invalid NODE_SELECTOR entry '{part}'. Expected key=value")
+        key, val = part.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key or not val:
+            raise ValueError(f"Invalid NODE_SELECTOR entry '{part}'. Expected key=value")
+        result[key] = val
+    return result

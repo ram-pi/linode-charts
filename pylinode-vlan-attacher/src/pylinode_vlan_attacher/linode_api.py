@@ -54,6 +54,9 @@ class LinodeAPI:
     def boot(self, linode_id: int) -> None:
         self.client.post(f"/linode/instances/{linode_id}/boot")
 
+    def reboot(self, linode_id: int) -> None:
+        self.client.post(f"/linode/instances/{linode_id}/reboot")
+
     def status(self, linode_id: int) -> str:
         data = self.client.get(f"/linode/instances/{linode_id}")
         return str(data.get("status", ""))
