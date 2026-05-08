@@ -33,6 +33,7 @@ class Config:
     vlan_cidr: str
     namespace: str
     pod_name: str
+    node_name: str
     lease_name: str
     lease_duration_seconds: int
     renew_interval_seconds: int
@@ -52,6 +53,7 @@ class Config:
             vlan_cidr=_required("VLAN_CIDR"),
             namespace=os.getenv("MY_NAMESPACE", "default").strip(),
             pod_name=os.getenv("MY_POD_NAME", default_pod_name).strip(),
+            node_name=os.getenv("MY_NODE_NAME", "").strip(),
             lease_name=os.getenv("LEASE_NAME", "pylinode-vlan-attacher-leader").strip(),
             lease_duration_seconds=int(os.getenv("LEASE_DURATION_SECONDS", "30")),
             renew_interval_seconds=int(os.getenv("RENEW_INTERVAL_SECONDS", "10")),

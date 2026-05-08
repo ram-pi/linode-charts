@@ -17,6 +17,10 @@ from .linode_api import LinodeAPI
 
 
 LOGGER = logging.getLogger(__name__)
+STATUS_LABEL = "lke-vlan-controller-status"
+STATUS_PENDING_BOOT = "pending_boot"
+STATUS_PENDING_REBOOT = "pending_reboot"
+STATUS_COMPLETED = "completed"
 
 
 class VLANAttacherController:
@@ -140,17 +144,11 @@ class VLANAttacherController:
 
         pending: list[dict[str, Any]] = []
         for node_name in nodes:
-            match = next((l for l in linodes if l["label"] == node_name), None)
-            if not match:
-                LOGGER.warning("no Linode found for node=%s", node_name)
+            candidate = self._build_candidate(node_name, linodes)
+            if candidate is None:
                 continue
-            configs = self.linode.configs_list(int(match["id"]))
-            if not configs:
-                LOGGER.warning("no config found for node=%s linode=%s", node_name, match["id"])
-                continue
-            config0 = configs[0]
-            if not self._has_vlan(config0, self.cfg.vlan_name):
-                pending.append({"node": node_name, "linode_id": int(match["id"]), "config_id": int(config0["id"]), "config": config0})
+            if not self._has_vlan(candidate["config"], self.cfg.vlan_name):
+                pending.append(candidate)
 
         LOGGER.info(
             "reconcile complete: nodes=%s vlan_known_linode_ids=%s pending_vlan_attach=%s apply_changes=%s",
@@ -169,6 +167,9 @@ class VLANAttacherController:
             LOGGER.info("observe-only pending sample: %s", sample)
             return
 
+        if self._recover_in_progress_node(nodes, linodes, cidr, used_ips, prefix):
+            return
+
         for candidate in pending:
             if not self.lease.try_acquire_or_renew():
                 LOGGER.info("lease lost before applying changes")
@@ -177,6 +178,9 @@ class VLANAttacherController:
             linode_id = int(candidate["linode_id"])
             config_id = int(candidate["config_id"])
             config_data = dict(candidate["config"])
+
+            if self._handoff_if_target_is_self(node_name):
+                return
 
             if not self._cluster_all_ready(excluding=node_name):
                 LOGGER.warning("cluster not healthy enough to cycle node=%s, deferring", node_name)
@@ -190,7 +194,7 @@ class VLANAttacherController:
             ipam = f"{next_ip}/{prefix}"
 
             LOGGER.info("attaching vlan to node=%s linode=%s ipam=%s", node_name, linode_id, ipam)
-            self._label_node(node_name, "lke-vlan-controller-status", "pending_reboot")
+            self._label_node(node_name, STATUS_LABEL, STATUS_PENDING_BOOT)
             self._cordon(node_name, True)
 
             payload = self._build_updated_config(config_data, ipam)
@@ -204,9 +208,128 @@ class VLANAttacherController:
             self._wait_node_ready(node_name, timeout_seconds=600)
 
             self._label_node(node_name, "vlan-ip", ipam.replace("/", "_"))
-            self._label_node(node_name, "lke-vlan-controller-status", "completed")
+            self._label_node(node_name, STATUS_LABEL, STATUS_COMPLETED)
             self._cordon(node_name, False)
             LOGGER.info("node=%s completed vlan attach", node_name)
+
+    def _recover_in_progress_node(
+        self,
+        nodes: list[str],
+        linodes: list[dict[str, Any]],
+        cidr: Any,
+        used_ips: set[str],
+        prefix: int,
+    ) -> bool:
+        for node_name in nodes:
+            status = self._node_label_value(node_name, STATUS_LABEL)
+            if status not in {STATUS_PENDING_BOOT, STATUS_PENDING_REBOOT}:
+                continue
+
+            LOGGER.info("recovery mode: node=%s status=%s", node_name, status)
+            candidate = self._build_candidate(node_name, linodes)
+            if candidate is None:
+                return True
+
+            config_data = dict(candidate["config"])
+            linode_id = int(candidate["linode_id"])
+            config_id = int(candidate["config_id"])
+
+            if self._has_vlan(config_data, self.cfg.vlan_name):
+                LOGGER.info("recovery mode: vlan already present for node=%s, waiting for Ready", node_name)
+                self._wait_node_ready(node_name, timeout_seconds=600)
+                ipam = self._extract_vlan_ipam(config_data)
+                if ipam:
+                    self._label_node(node_name, "vlan-ip", ipam.replace("/", "_"))
+                self._label_node(node_name, STATUS_LABEL, STATUS_COMPLETED)
+                self._cordon(node_name, False)
+                return True
+
+            next_ip = self._next_available_ip(cidr, used_ips)
+            if next_ip is None:
+                raise RuntimeError(f"No available IP left in {self.cfg.vlan_cidr} during recovery")
+            used_ips.add(next_ip)
+            ipam = f"{next_ip}/{prefix}"
+
+            LOGGER.info("recovery mode: resuming attach for node=%s ipam=%s", node_name, ipam)
+            self._cordon(node_name, True)
+            payload = self._build_updated_config(config_data, ipam)
+            self.linode.shutdown(linode_id)
+            self._wait_linode_status(linode_id, "offline", timeout_seconds=300)
+            self.linode.config_update(linode_id, config_id, payload)
+            self.linode.boot(linode_id)
+            self._wait_node_not_ready(node_name, timeout_seconds=180)
+            self._wait_node_ready(node_name, timeout_seconds=600)
+            self._label_node(node_name, "vlan-ip", ipam.replace("/", "_"))
+            self._label_node(node_name, STATUS_LABEL, STATUS_COMPLETED)
+            self._cordon(node_name, False)
+            return True
+        return False
+
+    def _handoff_if_target_is_self(self, target_node_name: str) -> bool:
+        if not self.cfg.node_name or target_node_name != self.cfg.node_name:
+            return False
+
+        if not self._has_alternate_ready_node(excluding=target_node_name):
+            LOGGER.warning(
+                "target node is where controller is running (%s) and no alternate Ready node exists; continuing in-place",
+                target_node_name,
+            )
+            return False
+
+        LOGGER.info(
+            "target node %s hosts current controller pod; cordoning and handing over leadership before reboot",
+            target_node_name,
+        )
+        self._label_node(target_node_name, STATUS_LABEL, STATUS_PENDING_BOOT)
+        self._cordon(target_node_name, True)
+        self._delete_self_pod()
+        return True
+
+    def _build_candidate(self, node_name: str, linodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+        match = next((l for l in linodes if l["label"] == node_name), None)
+        if not match:
+            LOGGER.warning("no Linode found for node=%s", node_name)
+            return None
+        configs = self.linode.configs_list(int(match["id"]))
+        if not configs:
+            LOGGER.warning("no config found for node=%s linode=%s", node_name, match["id"])
+            return None
+        config0 = configs[0]
+        return {"node": node_name, "linode_id": int(match["id"]), "config_id": int(config0["id"]), "config": config0}
+
+    def _node_label_value(self, node_name: str, key: str) -> str:
+        node = self.core.read_node(node_name)
+        if not node.metadata or not node.metadata.labels:
+            return ""
+        return str(node.metadata.labels.get(key, ""))
+
+    def _extract_vlan_ipam(self, config_data: dict[str, Any]) -> str:
+        for iface in config_data.get("interfaces", []):
+            if iface.get("purpose") == "vlan" and iface.get("label") == self.cfg.vlan_name:
+                return str(iface.get("ipam_address", ""))
+        return ""
+
+    def _delete_self_pod(self) -> None:
+        if not self.cfg.pod_name:
+            raise RuntimeError("MY_POD_NAME must be set to delete current pod for handoff")
+        LOGGER.info("deleting current pod %s/%s for leader handoff", self.cfg.namespace, self.cfg.pod_name)
+        self.core.delete_namespaced_pod(self.cfg.pod_name, self.cfg.namespace)
+        self.stop_event.set()
+
+    def _has_alternate_ready_node(self, excluding: str) -> bool:
+        data = self.core.list_node()
+        for node in data.items:
+            if not node.metadata or not node.metadata.name:
+                continue
+            if node.metadata.name == excluding:
+                continue
+            if getattr(node.spec, "unschedulable", False):
+                continue
+            conditions = node.status.conditions or []
+            ready = next((c for c in conditions if c.type == "Ready"), None)
+            if ready is not None and ready.status == "True":
+                return True
+        return False
 
     def _k8s_nodes(self) -> list[str]:
         data = self.core.list_node()

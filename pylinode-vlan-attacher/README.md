@@ -157,6 +157,7 @@ Failed/Error pod objects are commonly created during node reboot cycles. They of
 - IP allocation is first-free host order within `VLAN_CIDR`.
 - The allocator excludes IPs already used on the target VLAN and all IPs from `EXCLUDED_IPS`.
 - `NODE_SELECTOR` is optional and filters target nodes by labels (`key=value,key2=value2`).
+- Controller status label uses `lke-vlan-controller-status=pending_boot` during in-flight work (legacy `pending_reboot` is still recognized for recovery).
 - `APPLY_CHANGES=false` is the default and runs observe-only mode (safe for local testing).
 - Set `APPLY_CHANGES=true` only when mutation steps are implemented and validated.
 - Current implementation supports rolling VLAN attachment with leader election.
