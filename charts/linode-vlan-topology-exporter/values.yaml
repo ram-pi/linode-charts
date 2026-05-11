@@ -1,0 +1,46 @@
+image:
+  repository: ghcr.io/ram-pi/pylinode-vlan-topology-exporter
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+linodeToken: ""
+existingSecret: ""
+secretKey: token
+
+namespace:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+deployment:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+
+exporter:
+  scrapeIntervalSeconds: 60
+  maxWorkers: 32
+  maxRps: 15
+  metricsPort: 9108
+  vlanLabelFilter: ""
+
+service:
+  type: ClusterIP
+  port: 9108
+  annotations: {}
+
+commonLabels: {}
+commonAnnotations: {}
+
+nameOverride: ""
+fullnameOverride: ""

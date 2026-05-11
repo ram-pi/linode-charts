@@ -1,0 +1,17 @@
+[project]
+name = "pylinode-vlan-topology-exporter"
+version = "0.1.0"
+description = "Prometheus exporter for Linode VLAN topology"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "linode-api4>=5.43.0",
+    "prometheus-client>=0.25.0",
+]
+
+[project.scripts]
+pylinode-vlan-topology-exporter = "pylinode_vlan_topology_exporter.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
