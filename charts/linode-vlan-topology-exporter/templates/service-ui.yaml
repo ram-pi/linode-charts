@@ -1,0 +1,23 @@
+{{- if and .Values.ui.enabled .Values.ui.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "linode-vlan-topology-exporter.fullname" . }}-ui
+  labels:
+    {{- include "linode-vlan-topology-exporter.labels" . | nindent 4 }}
+  {{- with .Values.ui.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.ui.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "linode-vlan-topology-exporter.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: ui
+  ports:
+    - name: http
+      port: {{ .Values.ui.service.port }}
+      targetPort: topology-ui
+      protocol: TCP
+{{- end }}
