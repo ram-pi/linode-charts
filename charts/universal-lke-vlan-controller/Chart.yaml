@@ -5,7 +5,7 @@ description: >
   Uses Kubernetes Lease leader election for active/standby operation and
   performs rolling shutdown -> config-update -> boot sequencing.
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "0.1.0"
 keywords:
   - linode
