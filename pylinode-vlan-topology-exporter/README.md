@@ -2,6 +2,8 @@
 
 Prometheus exporter that scans Linode VLAN topology and exposes VLAN-to-Linode attachment data for Grafana dashboards.
 
+This repository also includes a live read-only topology UI service that reads directly from the exporter `/metrics` endpoint (no historical storage).
+
 ## Token permissions
 
 `LINODE_TOKEN` should have:
@@ -49,6 +51,30 @@ uv run pylinode-vlan-topology-exporter
 Then open:
 
 - `http://localhost:9108/metrics`
+
+## Live topology UI
+
+Run UI locally against an existing exporter:
+
+```bash
+export TOPOLOGY_UI_PORT="9200"
+export TOPOLOGY_METRICS_URL="http://localhost:9108/metrics"
+export TOPOLOGY_REFRESH_SECONDS="60"
+export TOPOLOGY_HTTP_TIMEOUT_SECONDS="5"
+
+uv run pylinode-vlan-topology-ui
+```
+
+Environment variables:
+
+- `TOPOLOGY_METRICS_URL` (default `http://exporter:9108/metrics`) - exporter metrics endpoint read by the UI
+- `TOPOLOGY_UI_PORT` (default `9200`) - UI listen port
+- `TOPOLOGY_REFRESH_SECONDS` (default `60`) - frontend polling interval
+- `TOPOLOGY_HTTP_TIMEOUT_SECONDS` (default `5`) - backend fetch timeout for metrics endpoint
+
+Open:
+
+- `http://localhost:9200`
 
 ## Docker
 
@@ -105,6 +131,7 @@ The exporter image is built locally by Compose from `Dockerfile` (no GHCR pull r
 Open:
 
 - Exporter: `http://localhost:9108/metrics`
+- Topology UI: `http://localhost:9200`
 - Prometheus: `http://localhost:9090`
 - Grafana: `http://localhost:3000`
 

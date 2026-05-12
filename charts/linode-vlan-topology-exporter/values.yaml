@@ -3,6 +3,28 @@ image:
   tag: "latest"
   pullPolicy: IfNotPresent
 
+ui:
+  enabled: false
+  image:
+    repository: ghcr.io/ram-pi/pylinode-vlan-topology-ui
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  refreshSeconds: 60
+  httpTimeoutSeconds: 5
+  port: 9200
+  resources:
+    requests:
+      cpu: "25m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 9200
+    annotations: {}
+
 linodeToken: ""
 existingSecret: ""
 secretKey: token
