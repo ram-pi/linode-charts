@@ -367,6 +367,24 @@ data:
         "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases/${LEASE_NAME}"
     }
 
+    lease_post() {
+      local body out code
+      out=$(mktemp /tmp/lease_post.XXXXXX)
+      body=$(printf '{
+        "apiVersion":"coordination.k8s.io/v1","kind":"Lease",
+        "metadata":{"name":"%s","namespace":"%s"},
+        "spec":{"holderIdentity":"%s","leaseDurationSeconds":%s,"renewTime":"%s"}
+      }' "$LEASE_NAME" "$MY_NAMESPACE" "$MY_POD_NAME" "$LEASE_DURATION_SECONDS" "$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)")
+      code=$(curl -s -o "$out" -w "%{http_code}" -X POST \
+        -H "Authorization: Bearer $(cat $K8S_TOKEN_FILE)" \
+        -H "Content-Type: application/json" \
+        --cacert "$K8S_CA" \
+        --data "$body" \
+        "${K8S_API}/apis/coordination.k8s.io/v1/namespaces/${MY_NAMESPACE}/leases")
+      rm -f "$out"
+      [ "$code" = "201" ] || [ "$code" = "200" ]
+    }
+
     lease_put() {
       local resource_version="$1" body out code
       out=$(mktemp /tmp/lease_put.XXXXXX)
@@ -412,7 +430,17 @@ data:
               echo "INFO: Lease held by $holder (expires in $((expired_at - now))s) -- standby"
             fi
           fi
+        elif [ "$code" = "404" ]; then
+          rm -f "$f"
+          echo "INFO: Lease not found, creating it"
+          if lease_post; then
+            echo "INFO: leader Lease created and acquired"
+            return 0
+          else
+            echo "WARN: Failed to create Lease"
+          fi
         else
+          echo "WARN: Failed to get Lease (HTTP $code) -- will retry"
           rm -f "$f"
         fi
         sleep "$RENEW_INTERVAL_SECONDS"
@@ -562,6 +590,7 @@ data:
         echo "INFO: used IPs on VLAN ${VLAN_NAME}: $(tr '\n' ' ' < "$USED_IPS_FILE")"
 
         for ENTRY in $NEEDS_CONFIG; do
+          renew_lease
           NODE_NAME=$(echo "$ENTRY" | cut -d: -f1)
           LINODE_ID=$(echo "$ENTRY" | cut -d: -f2)
           CONFIG_ID=$(echo "$ENTRY" | cut -d: -f3)
@@ -694,6 +723,7 @@ data:
 
         # Phase A: cycle nodes that are already degraded.
         for ENTRY in $NEEDS_REBOOT; do
+          renew_lease
           NODE_NAME=$(echo "$ENTRY"     | cut -d: -f1)
           LINODE_ID=$(echo "$ENTRY"     | cut -d: -f2)
           VLAN_IP_LABEL=$(echo "$ENTRY" | cut -d: -f3)
@@ -738,6 +768,7 @@ data:
 
         # Phase B: shut down and boot healthy running nodes (requires healthy cluster).
         for ENTRY in $STILL_NEEDS_SHUTDOWN; do
+          renew_lease
           NODE_NAME=$(echo "$ENTRY"     | cut -d: -f1)
           LINODE_ID=$(echo "$ENTRY"     | cut -d: -f2)
           VLAN_IP_LABEL=$(echo "$ENTRY" | cut -d: -f3)
