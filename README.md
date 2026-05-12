@@ -31,21 +31,21 @@ helm upgrade --install lke-fw-updater oci://ghcr.io/ram-pi/lke-firewall-updater 
 ### lke-vlan-controller
 ```bash
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller \
-  --version 0.2.0 --namespace lke-vlan-controller --create-namespace \
+  --version 0.3.1 --namespace lke-vlan-controller --create-namespace \
   --set vlan.name=my-vlan --set vlan.cidr=172.20.200.0/24 --set linodeToken=<TOKEN>
 ```
 
 ### lke-vlan-controller-enterprise
 ```bash
 helm upgrade --install lke-vlan-controller-enterprise oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
-  --version 0.2.2 --namespace lke-vlan-controller --create-namespace \
+  --version 0.2.3 --namespace lke-vlan-controller --create-namespace \
   --set vlan.name=my-vlan --set vlan.cidr=172.20.200.0/24 --set linodeToken=<TOKEN>
 ```
 
 ### universal-lke-vlan-controller
 ```bash
 helm upgrade --install universal-lke-vlan-controller oci://ghcr.io/ram-pi/universal-lke-vlan-controller \
-  --version 0.1.0 --namespace lke-vlan-controller --create-namespace \
+  --version 0.1.1 --namespace lke-vlan-controller --create-namespace \
   --set vlan.name=my-vlan --set vlan.cidr=172.16.1.0/24 \
   --set 'vlan.excludedIPs={172.16.1.1,172.16.1.2}' \
   --set 'controller.nodeSelector.vlan=enabled' \
@@ -55,7 +55,7 @@ helm upgrade --install universal-lke-vlan-controller oci://ghcr.io/ram-pi/univer
 ### linode-vlan-topology-exporter
 ```bash
 helm upgrade --install linode-vlan-topology-exporter oci://ghcr.io/ram-pi/linode-vlan-topology-exporter \
-  --version 0.1.0 --namespace linode-vlan-topology-exporter --create-namespace \
+  --version 0.1.3 --namespace linode-vlan-topology-exporter --create-namespace \
   --set existingSecret=linode-token \
   --set ui.enabled=true \
   --set ui.service.type=LoadBalancer
