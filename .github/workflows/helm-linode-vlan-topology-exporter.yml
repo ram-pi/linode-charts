@@ -8,8 +8,6 @@ on:
     paths:
       - "charts/linode-vlan-topology-exporter/**"
       - ".github/workflows/helm-linode-vlan-topology-exporter.yml"
-    tags:
-      - "charts/linode-vlan-topology-exporter/v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

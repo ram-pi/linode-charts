@@ -8,8 +8,6 @@ on:
     paths:
       - "charts/lke-vlan-controller-enterprise/**"
       - ".github/workflows/helm-lke-vlan-controller-enterprise.yml"
-    tags:
-      - "charts/lke-vlan-controller-enterprise/v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

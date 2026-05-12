@@ -8,8 +8,6 @@ on:
     paths:
       - "charts/lke-firewall-updater/**"
       - ".github/workflows/helm-lke-firewall-updater.yml"
-    tags:
-      - "charts/lke-firewall-updater/v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

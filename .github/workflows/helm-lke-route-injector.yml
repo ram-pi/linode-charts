@@ -8,8 +8,6 @@ on:
     paths:
       - "charts/lke-route-injector/**"
       - ".github/workflows/helm-lke-route-injector.yml"
-    tags:
-      - "charts/lke-route-injector/v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -8,8 +8,6 @@ on:
     paths:
       - "charts/lke-ufw-interface-enforcer/**"
       - ".github/workflows/helm-lke-ufw-interface-enforcer.yml"
-    tags:
-      - "charts/lke-ufw-interface-enforcer/v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
