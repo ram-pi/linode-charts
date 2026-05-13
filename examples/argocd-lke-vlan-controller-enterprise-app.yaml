@@ -1,0 +1,51 @@
+# Argo CD Application example for lke-vlan-controller-enterprise.
+#
+# Prerequisites:
+# 1) Install Argo CD:
+#    kubectl create namespace argocd
+#    kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+#
+# 2) Create namespace + Linode token Secret for the controller:
+#    kubectl create namespace lke-vlan-controller
+#    kubectl -n lke-vlan-controller create secret generic linode-token \
+#      --from-literal=token=<YOUR_LINODE_TOKEN>
+#
+#    Note: this chart defaults to secretKey=token. If your Secret key is
+#    different (for example linodeToken), set spec.source.helm.values.secretKey.
+#
+# 3) Apply this Application:
+#    kubectl apply -f examples/argocd-lke-vlan-controller-enterprise-app.yaml
+#
+# 4) (Optional) Trigger sync from Argo CD UI/CLI if automated sync is disabled.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lke-vlan-controller-enterprise
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ram-pi/linode-charts.git
+    targetRevision: main
+    path: charts/lke-vlan-controller-enterprise
+    helm:
+      values: |
+        vlan:
+          name: "test-123"
+          cidr: "172.30.10.0/24"
+        existingSecret: "linode-token"
+        secretKey: "token"
+        # Optional tuning for large clusters.
+        leaderElection:
+          leaseDurationSeconds: 60
+          renewIntervalSeconds: 20
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: lke-vlan-controller
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

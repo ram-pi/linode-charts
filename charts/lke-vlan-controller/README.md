@@ -165,6 +165,8 @@ The label value is not significant — any non-empty value causes the node to be
 
 The chart renders a PodDisruptionBudget only when `deployment.replicas > 1`. This preserves disruption protection for HA installs while avoiding `minAvailable: 1` blocking behavior when operators intentionally run a single controller replica.
 
+Important: VLAN presence is checked by VLAN label. If a node already has a different VLAN label attached, the controller treats that node as pending for the configured `vlan.name` and preserves the existing different-label VLAN interface. This can result in multiple VLAN interfaces on the same node.
+
 ---
 
 ## Observability

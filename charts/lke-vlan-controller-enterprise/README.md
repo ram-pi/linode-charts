@@ -42,7 +42,7 @@ The VLAN already exists in the target region. You will supply:
 
 ```bash
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
-  --version 0.2.2 \
+  --version 0.2.3 \
   --namespace lke-vlan-controller \
   --create-namespace \
   --set vlan.name=<VLAN_LABEL> \
@@ -59,7 +59,7 @@ kubectl create secret generic linode-token \
   --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install lke-vlan-controller oci://ghcr.io/ram-pi/lke-vlan-controller-enterprise \
-  --version 0.2.2 \
+  --version 0.2.3 \
   --namespace lke-vlan-controller \
   --create-namespace \
   --set vlan.name=<VLAN_LABEL> \
@@ -115,6 +115,8 @@ When `deployment.replicas > 1`, the chart also renders a PodDisruptionBudget wit
    - loops every 60 seconds, re-checking until every node has the interface
 
 All API calls use `linode-cli` with the token supplied via a Kubernetes Secret; the controller adds the VLAN interface only once per node.
+
+Important: VLAN presence is checked by VLAN label. If a node already has a different VLAN label attached, the controller treats that node as pending for the configured `vlan.name` and preserves the existing different-label VLAN interface. This can result in multiple VLAN interfaces on the same node.
 
 The chart renders a PodDisruptionBudget only when `deployment.replicas > 1`. This keeps voluntary disruptions possible for intentionally single-replica installs while still protecting HA standby deployments.
 

@@ -35,3 +35,4 @@ helm upgrade --install universal-lke-vlan-controller ./charts/universal-lke-vlan
 - `controller.createNamespaceIfMissing=true` lets the controller create `MY_NAMESPACE` at runtime (requires extra RBAC; normally keep this `false` and rely on Helm namespace creation).
 - IP assignment is first-free host order within `vlan.cidr`, excluding existing VLAN-assigned IPs and `vlan.excludedIPs`.
 - If the leader pod is scheduled on the node selected for update, the controller cordons that node and deletes its own pod first so a standby can take over, then proceeds with the node reboot in the new leader.
+- VLAN presence is checked by VLAN label. If a node already has a different VLAN label attached, the controller still applies the configured `vlan.name` and preserves the existing different-label VLAN interface, which can result in multiple VLAN interfaces on one node.
