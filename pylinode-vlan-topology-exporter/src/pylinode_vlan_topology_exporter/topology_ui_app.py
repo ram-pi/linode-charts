@@ -76,8 +76,9 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(BASE_DIR / "topology_ui_templates"))
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "topology_ui_static")), name="static")
 
-    @app.get("/healthz")
+    @app.api_route("/healthz", methods=["GET", "HEAD"])
     def healthz() -> dict[str, str]:
+        """Health check endpoint. Supports both GET and HEAD for NodeBalancer probes."""
         return {"status": "ok"}
 
     @app.get("/api/topology")

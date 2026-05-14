@@ -90,13 +90,18 @@ list-lke:
 ## create-lke-enterprise: Create a test LKE Enterprise cluster (latest enterprise version auto-detected)
 .PHONY: create-lke-enterprise
 create-lke-enterprise:
-	$(eval ENTERPRISE_VERSION := $(shell linode-cli lke tiered-versions-list enterprise --text 2>/dev/null | awk 'NR==2 {print $$1}'))
-	@test -n "$(ENTERPRISE_VERSION)" || (echo "Could not detect latest LKE Enterprise version"; exit 1)
-	@echo "Using LKE Enterprise version: $(ENTERPRISE_VERSION)"
+	@# Use the user-provided ENTERPRISE_VERSION if set; otherwise auto-detect the latest
+	@if [ -z "$(ENTERPRISE_VERSION)" ]; then \
+		ENTERPRISE_VERSION=$$(linode-cli lke tiered-versions-list enterprise --text 2>/dev/null | awk 'NR==2 {print $$1}'); \
+	else \
+		ENTERPRISE_VERSION="$(ENTERPRISE_VERSION)"; \
+	fi; \
+	@test -n "$$ENTERPRISE_VERSION" || (echo "Could not detect LKE Enterprise version; set ENTERPRISE_VERSION=<version>"; exit 1); \
+	@echo "Using LKE Enterprise version: $$ENTERPRISE_VERSION"; \
 	LINODE_CLI_API_VERSION=v4beta linode-cli lke cluster-create \
 		--label "$(CLUSTER_LABEL)" \
 		--region "$(REGION)" \
-		--k8s_version "$(ENTERPRISE_VERSION)" \
+		--k8s_version "$$ENTERPRISE_VERSION" \
 		--tier enterprise \
 		--node_pools '[{"type":"$(NODE_TYPE)","count":$(NODE_COUNT)}]'
 	@echo ""
