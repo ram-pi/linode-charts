@@ -185,7 +185,7 @@ Container startup args — installs only the runtime deps required for the
 enabled providers, then executes the controller script.
 Linode + AWS: stock Alpine + curl + jq + aws-cli (all available in apk).
 GCP: user must override controller.image to google/cloud-sdk:alpine since
-     gcloud is not available via apk. aws-cli is still added if AWS is also enabled.
+	gcloud is not available via apk. aws-cli is still added if AWS is also enabled.
 */}}
 {{- define "lke-firewall-updater.containerArgs" -}}
 {{- $deps := list "curl" "jq" -}}

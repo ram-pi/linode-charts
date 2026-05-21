@@ -85,6 +85,7 @@ helm upgrade --install lke-fw-updater charts/lke-firewall-updater \
 | `nodeLabeling.labelKey` | Label key applied to nodes | `firewall.lke.linode.com/ready` |
 | `nodeLabeling.labelValue` | Label value applied to nodes | `"true"` |
 | `controller.replicas` | Number of controller pods (standby pods wait for leader) | `2` |
+| `controller.image` | Controller image repository/tag/pull policy | `alpine:3.21.3`, `IfNotPresent` |
 | `controller.debounceSeconds` | Seconds to wait after a watch event before reconciling | `3` |
 | `controller.reconcileInterval` | Safety-net full reconcile interval (seconds) | `300` |
 | `rule.name` | Fallback rule name (auto-detected as `lke-nodes-{cluster_id}`) | `lke-nodes` |
@@ -106,6 +107,8 @@ helm upgrade --install lke-fw-updater charts/lke-firewall-updater \
 | `providers.gcp.firewallRuleName` | Name of the VPC firewall rule | `""` |
 | `providers.gcp.serviceAccountJson` | Inline Service Account JSON key | `""` |
 | `providers.gcp.existingSecret` | Name of pre-existing Secret with `key.json` | `""` |
+
+When `controller.replicas > 1`, the chart also renders a PodDisruptionBudget with `minAvailable: 1`. Single-replica installs intentionally omit the PDB so voluntary disruptions do not deadlock.
 
 ---
 
@@ -133,6 +136,8 @@ The controller runs as a Deployment with `replicas >= 1`. Replicas compete for a
 - **Lease holder** (leader): Actively performs reconciliations.
 - **Non-leaders**: Sleep and wait to acquire the lease if the current leader crashes.
 - **Lease renewal**: Leader renews the lease every `renewIntervalSeconds` (default: `10` seconds). If a leader crashes or becomes unresponsive, a standby pod acquires the lease within `leaseDurationSeconds` (default: `30` seconds).
+
+The chart renders a PodDisruptionBudget only when `controller.replicas > 1`. Single-replica installs intentionally omit the PDB so voluntary disruption operations such as node drains and cluster upgrades do not deadlock on `minAvailable: 1`.
 
 ### Timing Example
 

@@ -7,6 +7,8 @@ Applies an interface-scoped UFW policy on selected LKE nodes via a DaemonSet.
 - **Outbound allowed** — keeps outbound traffic allowed so nodes and pods can reach NAT/VPN gateways and receive return traffic
 - **Node targeting** — runs only on nodes matching `deployment.nodeSelector` (default `lke-vlan-controller-status=completed`)
 
+> Important: In LKE clusters using Cilium with kube-proxy replacement, NodePort forwarding is handled by Cilium datapath logic. This chart enforces host UFW policy, but NodePort exposure is not reliably constrained by these UFW rules alone.
+
 ---
 
 ## Requirements

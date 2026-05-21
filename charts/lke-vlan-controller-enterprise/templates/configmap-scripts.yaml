@@ -494,9 +494,10 @@ data:
 
       for NODE_NAME in $NODE_NAMES; do
         renew_lease
-        LINODE_ID=$(linode-cli linodes list --json 2>/dev/null \
-          | jq -r --arg label "$NODE_NAME" '.[] | select(.label==$label) | .id' \
-          | head -1)
+        # Use --label filter to avoid fetching all pages (accounts with >100 Linodes
+        # would silently miss nodes beyond page 1 with an unfiltered list).
+        LINODE_ID=$(linode-cli linodes list --label "$NODE_NAME" --json 2>/dev/null \
+          | jq -r '.[0].id // empty')
         if [ -z "$LINODE_ID" ]; then
           echo "WARN: no Linode found for node $NODE_NAME -- skipping"
           continue

@@ -9,6 +9,10 @@ policy:
   # Only these port/protocol rules are allowed inbound on that interface.
   # Everything else inbound on that interface is denied.
   #
+  # Note: On clusters running Cilium with kube-proxy replacement,
+  # Kubernetes NodePort forwarding may bypass host-level UFW constraints.
+  # Use cloud-edge firewall controls for NodePort exposure.
+  #
   # port may be a single port ("443") or range ("20000:20100").
   # protocol supports: tcp, udp
   inboundRules: []
