@@ -1,0 +1,22 @@
+apiVersion: v2
+name: lke-node-cache-manager
+description: >
+  Node-level cache manager for Linode LKE. Deploys a DaemonSet to prefetch and
+  manage cached assets (models, datasets, files) on every node. Supports multiple
+  sources: Hugging Face, S3, HTTPS URLs, and OCI artifacts. Features include
+  garbage collection of stale assets, disk-space awareness, checksum verification,
+  and Prometheus metrics.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - linode
+  - lke
+  - cache
+  - models
+  - datasets
+  - daemonset
+sources:
+  - https://github.com/ram-pi/linode-charts
+maintainers:
+  - name: ram-pi

@@ -87,6 +87,21 @@ cache_size_gb = Gauge(
     "cache_size_gigabytes",
     "Total cache size in gigabytes",
 )
+cache_asset_declared = Gauge(
+    "cache_asset_declared",
+    "Configured cache asset metadata (always 1 for declared assets)",
+    ["asset", "source", "ref", "version", "destination"],
+)
+cache_asset_present = Gauge(
+    "cache_asset_present",
+    "Whether configured asset destination currently exists on disk (1 or 0)",
+    ["asset", "destination"],
+)
+cache_asset_size_bytes = Gauge(
+    "cache_asset_size_bytes",
+    "Current on-disk size in bytes for configured asset destination",
+    ["asset", "destination"],
+)
 
 
 def _path_size_bytes(path: Path) -> int:
@@ -157,8 +172,49 @@ class CacheManager:
         }
         self.download_manager = DownloadManager(adapters)
         self._state_file = self.cache_root / ".managed_paths.json"
+        self._declared_metric_labels: set[tuple[str, str, str, str, str]] = set()
+        self._status_metric_labels: set[tuple[str, str]] = set()
 
         self._logger = logging.getLogger(self.__class__.__name__)
+
+    def _update_asset_inventory_metrics(self) -> None:
+        """Publish per-asset inventory metrics and clear stale label sets."""
+        current_declared: set[tuple[str, str, str, str, str]] = set()
+        current_status: set[tuple[str, str]] = set()
+
+        for entry in self.manifest.caches:
+            declared_labels = (
+                entry.name,
+                entry.source.value,
+                entry.ref,
+                entry.version,
+                entry.destination,
+            )
+            current_declared.add(declared_labels)
+            cache_asset_declared.labels(*declared_labels).set(1)
+
+            status_labels = (entry.name, entry.destination)
+            current_status.add(status_labels)
+
+            destination = self.storage.get_destination_path(entry.destination)
+            if destination.exists():
+                size_bytes = _path_size_bytes(destination)
+                cache_asset_present.labels(*status_labels).set(1)
+                cache_asset_size_bytes.labels(*status_labels).set(size_bytes)
+            else:
+                cache_asset_present.labels(*status_labels).set(0)
+                cache_asset_size_bytes.labels(*status_labels).set(0)
+
+        for labels in self._declared_metric_labels - current_declared:
+            cache_asset_declared.remove(*labels)
+
+        stale_status = self._status_metric_labels - current_status
+        for labels in stale_status:
+            cache_asset_present.remove(*labels)
+            cache_asset_size_bytes.remove(*labels)
+
+        self._declared_metric_labels = current_declared
+        self._status_metric_labels = current_status
 
     @staticmethod
     def _normalize_credentials_ref(credentials_ref: str) -> str:
@@ -238,6 +294,7 @@ class CacheManager:
                 return
 
             if not self.manifest.caches:
+                self._update_asset_inventory_metrics()
                 self._logger.info("No cache entries configured")
                 return
 
@@ -310,6 +367,7 @@ class CacheManager:
             _set_storage_metrics(
                 usage["used"], usage["free"], usage["total"], self.storage.get_cache_size()
             )
+            self._update_asset_inventory_metrics()
             self._log_storage_status("after")
 
             self._logger.info("Reconciliation complete")

@@ -13,6 +13,7 @@ A collection of Helm charts created and used within Linode / Akamai Cloud.
 | [linode-vlan-topology-exporter](charts/linode-vlan-topology-exporter/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/linode-vlan-topology-exporter/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/linode-vlan-topology-exporter) | Prometheus exporter that discovers Linode VLAN topology (legacy config + new Linode interfaces) and exposes metrics for Grafana dashboards. Includes an optional live web UI for visualizing the VLAN topology. |
 | [lke-route-injector](charts/lke-route-injector/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-route-injector/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-route-injector) | Injects static IP routes on targeted LKE nodes via a DaemonSet — routes survive reboots and are re-applied on a configurable interval |
 | [lke-ufw-interface-enforcer](charts/lke-ufw-interface-enforcer/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-ufw-interface-enforcer/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-ufw-interface-enforcer) | Enforces interface-scoped UFW policy on targeted LKE nodes using explicit interface targeting (for example eth2), allows selected inbound ports, and keeps outbound traffic allowed |
+| [lke-node-cache-manager](charts/lke-node-cache-manager/) | [![Version](https://img.shields.io/badge/dynamic/yaml?logo=helm&label=version&query=$.version&url=https://raw.githubusercontent.com/ram-pi/linode-charts/main/charts/lke-node-cache-manager/Chart.yaml)](https://github.com/ram-pi/linode-charts/pkgs/container/lke-node-cache-manager) | Node-level cache manager for LKE clusters; prefetches and manages cached assets (models, datasets, files) on every node; supports Hugging Face, S3, HTTPS, and OCI artifact sources with garbage collection, disk-space awareness, checksum verification, and Prometheus metrics |
 
 ## Install from GHCR
 
@@ -80,11 +81,24 @@ helm upgrade --install lke-ufw-interface-enforcer oci://ghcr.io/ram-pi/lke-ufw-i
   --set 'policy.inboundRules[1].protocol=tcp'
 ```
 
+### lke-node-cache-manager
+```bash
+helm upgrade --install node-cache oci://ghcr.io/ram-pi/lke-node-cache-manager \
+  --version 0.1.0 \
+  --namespace node-cache \
+  --create-namespace \
+  --values examples/lke-node-cache-manager.values.yaml
+```
+
+See `examples/localai-app.lke-node-cache-manager.yaml` for a CPU-only LocalAI inference demo that uses the cached model.
+
 For chart-specific values and more installation options, see each chart's `README.md`.
 
-Sample values files are available under `examples/`, including:
+Sample values files and manifests are available under `examples/`, including:
 
 - `examples/lke-ufw-interface-enforcer.values.yaml`
+- `examples/lke-node-cache-manager.values.yaml`
+- `examples/localai-app.lke-node-cache-manager.yaml`
 
 ## Related projects
 

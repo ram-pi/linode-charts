@@ -1,0 +1,124 @@
+# -- Cache root directory on each node (hostPath mount).
+# This directory will be created if it does not exist.
+cacheRoot: /opt/node-cache
+
+# -- Pod-level security context for the cache manager daemon.
+podSecurityContext:
+  # -- Keep daemon process non-root by default.
+  runAsNonRoot: true
+  # -- UID used by the cache manager process.
+  runAsUser: 1000
+  # -- GID used by the cache manager process.
+  runAsGroup: 2000
+  # -- fsGroup applied to mounted volumes where supported.
+  fsGroup: 2000
+
+# -- Initialize hostPath permissions before daemon starts.
+initPermissions:
+  # -- If true, an initContainer ensures cacheRoot is writable by runAsUser/runAsGroup.
+  enabled: true
+  # -- Image used for permission initialization.
+  image: busybox:1.36.1
+  # -- Mode applied to cacheRoot directory.
+  cacheRootMode: "0775"
+  # -- If true, recursively chown cacheRoot (slower on large caches).
+  chownRecursive: false
+
+# -- List of cache entries (assets) to download and maintain on each node.
+# REQUIRED — chart will fail to render if empty.
+# Each entry specifies the source, reference, version, and local destination.
+assets: []
+# Example:
+#   - name: "stable-diffusion-1.5"
+#     source: "huggingface"
+#     ref: "runwayml/stable-diffusion-v1-5"
+#     version: "1.5.0"
+#     destination: "models/sd-1.5"
+#     sha256: "optional-hash-for-verification"
+#     credentials_ref: "optional-secret-name"
+#   - name: "training-data-2025"
+#     source: "s3"
+#     ref: "s3://my-bucket/datasets/train-2025-01.tar.gz"
+#     version: "2025-01-15"
+#     destination: "datasets/train-2025-01"
+
+# -- Seconds between reconciliation loops.
+# The daemon checks cache state, downloads missing/updated assets, and runs GC.
+reconcileIntervalSeconds: 900
+
+# -- Minimum free disk percentage before skipping new downloads.
+# If free disk % drops below this threshold, downloads are skipped with a warning.
+minFreeDiskPercent: 10
+
+# -- Timeout in seconds for individual asset downloads.
+downloadTimeoutSeconds: 3600
+
+namespace:
+  # -- Create the namespace as part of this Helm release.
+  # Set to false if you manage namespaces externally (e.g. via GitOps).
+  create: true
+  # -- Namespace name override.
+  name: ""
+
+deployment:
+  image:
+    # -- Docker image repository.
+    repository: ghcr.io/ram-pi/pylinode-node-cache-manager
+    # -- Image tag (should not be :latest).
+    tag: "0.1.0"
+    # -- Image pull policy.
+    pullPolicy: IfNotPresent
+
+  # -- Resource requests and limits for the cache manager pod.
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+  # -- Node selector applied to the DaemonSet pod.
+  # Default {} targets ALL nodes.
+  # Example: { cache-enabled: "true" } to target only specific nodes.
+  nodeSelector: {}
+
+  # -- Tolerations for the DaemonSet pod.
+  # By default, empty; pods run on all nodes including tainted ones.
+  tolerations: []
+
+# -- Prometheus metrics server configuration.
+metrics:
+  # -- Port to expose /metrics endpoint.
+  port: 8080
+  # -- Enable metrics endpoint and create Service for scraping.
+  enabled: true
+
+# -- Kubernetes credentials for sources that require authentication.
+# These can be overridden by per-asset credentials_ref (Kubernetes Secret).
+credentials:
+  # -- Hugging Face API token (optional, for private models).
+  huggingface_token: ""
+  # -- AWS S3 access key (optional).
+  aws_access_key_id: ""
+  # -- AWS S3 secret key (optional).
+  aws_secret_access_key: ""
+
+serviceAccount:
+  # -- If true, create a ServiceAccount. Set to false to bring your own.
+  create: true
+  # -- Name override. Defaults to the chart fullname.
+  name: ""
+  annotations: {}
+
+# -- Labels added to all resources.
+commonLabels: {}
+
+# -- Annotations added to all resources.
+commonAnnotations: {}
+
+# -- Chart name override.
+nameOverride: ""
+
+# -- Full chart name override.
+fullnameOverride: ""

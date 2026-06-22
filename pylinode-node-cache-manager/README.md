@@ -13,19 +13,7 @@ Node-level cache manager for Linode LKE. Manages prefetching and garbage collect
 - **Non-root execution**: Runs as unprivileged user by default
 - **Kubernetes-native**: Credentials via Kubernetes Secrets; env var configuration
 
-## Installation
-
-### Via Helm Chart
-
-```bash
-helm repo add linode-charts https://ram-pi.github.io/linode-charts
-helm repo update
-helm upgrade --install node-cache linode-charts/lke-node-cache-manager \
-  --namespace node-cache \
-  --create-namespace
-```
-
-### Local Development
+## Local Development
 
 ```bash
 git clone https://github.com/ram-pi/linode-charts.git
@@ -45,7 +33,7 @@ uv run pylinode-node-cache-manager
 uv run pytest
 ```
 
-### Docker Build & Run Locally
+## Docker Build & Run Locally
 
 ```bash
 cd pylinode-node-cache-manager
@@ -114,7 +102,7 @@ ls -lh /tmp/node-cache-local/
 > mkdir -p /tmp/node-cache-local && sudo chown 1000 /tmp/node-cache-local
 > ```
 
-### Local Run Example (Custom Path + Models + Endpoints)
+## Local Run Example (Custom Path + Models + Endpoints)
 
 Use this example to run the daemon locally with:
 - a specific cache path
@@ -250,6 +238,9 @@ Prometheus metrics exposed on `http://<pod>:8080/metrics`:
 - `cache_download_success_total{source,asset}`: Successful downloads
 - `cache_download_failure_total{source,asset,reason}`: Failed downloads
 - `cache_download_bytes_total{asset}`: Total bytes downloaded per asset
+- `cache_asset_declared{asset,source,ref,version,destination}`: Declared assets from config (`1` when configured)
+- `cache_asset_present{asset,destination}`: Whether destination currently exists on disk (`1` or `0`)
+- `cache_asset_size_bytes{asset,destination}`: Current on-disk size for each configured asset destination
 - `cache_gc_runs_total`: Total GC cycles
 - `cache_gc_bytes_freed_total`: Bytes deleted by GC
 - `cache_gc_failures_total`: GC cycle failures
