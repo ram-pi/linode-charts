@@ -1,0 +1,98 @@
+# 1. Install or upgrade the node cache manager and download the CPU-friendly GGUF model.
+#    This chart is exact-state: assets removed from the values file are garbage-collected.
+#    helm upgrade --install node-cache ./charts/lke-node-cache-manager \
+#      --namespace node-cache \
+#      --create-namespace \
+#      --values examples/lke-node-cache-manager.values.yaml
+#    kubectl get configmap -n node-cache node-cache-lke-node-cache-manager-env -o yaml
+#
+# 2. Wait for the DaemonSet and confirm the model exists on the node hostPath:
+#    kubectl rollout status ds/node-cache-lke-node-cache-manager -n node-cache
+#    kubectl logs -n node-cache -l app.kubernetes.io/name=lke-node-cache-manager --tail=100
+#    kubectl apply -f examples/pod.lke-node-cache-manager.yaml
+#    kubectl exec ai-app -- ls -lh /models/qwen2.5-0.5b-instruct-q2_k.gguf
+#
+#    If LocalAI cannot find the file, check the node it landed on and the cache
+#    manager pod on the same node:
+#    kubectl get pod localai-app -o wide
+#    kubectl get pod -n node-cache -l app.kubernetes.io/name=lke-node-cache-manager -o wide
+#    kubectl logs -n node-cache <cache-manager-pod-on-same-node> --tail=100
+#
+# 3. Recreate this LocalAI pod after the cache file exists, then port-forward and test inference:
+#    kubectl delete pod localai-app --ignore-not-found
+#    kubectl apply -f examples/localai-app.lke-node-cache-manager.yaml
+#    kubectl wait --for=condition=Ready pod/localai-app --timeout=300s
+#    kubectl port-forward pod/localai-app 8080:8080
+#
+#  curl http://localhost:8080/v1/chat/completions \
+#    -H "Content-Type: application/json" \
+#    -d '{
+#      "model": "qwen2.5-0.5b-instruct-q2_k.gguf",
+#      "messages": [{"role": "user", "content": "Why is the sky blue in 10 words or less?"}],
+#      "temperature": 0.2,
+#      "max_tokens": 32
+#    }'
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: localai-app
+spec:
+  initContainers:
+    - name: wait-for-cached-model
+      image: busybox:1.36.1
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          model=/models/qwen2.5-0.5b-instruct-q2_k.gguf
+          for i in $(seq 1 120); do
+            if [ -s "$model" ]; then
+              ls -lh "$model"
+              exit 0
+            fi
+            echo "Waiting for cached model on this node: $model"
+            ls -lah /models || true
+            sleep 10
+          done
+          echo "Timed out waiting for cached model: $model" >&2
+          exit 1
+      resources:
+        requests:
+          cpu: "10m"
+          memory: 32Mi
+        limits:
+          cpu: "100m"
+          memory: 64Mi
+      volumeMounts:
+        - name: cache
+          mountPath: /models
+          readOnly: true
+  containers:
+    - name: localai-cpu-server
+      image: localai/localai:latest-cpu
+      env:
+        - name: MODELS_PATH
+          value: /models
+        - name: THREADS
+          value: "4"
+      ports:
+        - containerPort: 8080
+          name: http
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+        limits:
+          cpu: "4"
+          memory: 6Gi
+      volumeMounts:
+        - name: cache
+          mountPath: /models
+          readOnly: true
+  volumes:
+    - name: cache
+      hostPath:
+        path: /opt/node-cache/models
+        type: Directory

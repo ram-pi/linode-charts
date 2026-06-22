@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "lke-node-cache-manager.fullname" . }}
+  labels:
+    {{- include "lke-node-cache-manager.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lke-node-cache-manager.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lke-node-cache-manager.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Restart pods when the assets list changes (e.g. new assets added, versions updated).
+        checksum/env: {{ include (print $.Template.BasePath "/configmap-env.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "lke-node-cache-manager.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: {{ .Values.podSecurityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.podSecurityContext.runAsUser }}
+        runAsGroup: {{ .Values.podSecurityContext.runAsGroup }}
+        fsGroup: {{ .Values.podSecurityContext.fsGroup }}
+      {{- if .Values.initPermissions.enabled }}
+      initContainers:
+        - name: init-cache-permissions
+          image: {{ .Values.initPermissions.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p {{ .Values.cacheRoot | quote }}
+              chown {{ .Values.podSecurityContext.runAsUser }}:{{ .Values.podSecurityContext.runAsGroup }} {{ .Values.cacheRoot | quote }}
+              chmod {{ .Values.initPermissions.cacheRootMode }} {{ .Values.cacheRoot | quote }}
+              {{- if .Values.initPermissions.chownRecursive }}
+              chown -R {{ .Values.podSecurityContext.runAsUser }}:{{ .Values.podSecurityContext.runAsGroup }} {{ .Values.cacheRoot | quote }}
+              {{- end }}
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - CHOWN
+                - FOWNER
+                - DAC_OVERRIDE
+              drop:
+                - ALL
+          volumeMounts:
+            - name: cache-root
+              mountPath: {{ .Values.cacheRoot }}
+      {{- end }}
+      {{- with .Values.deployment.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.deployment.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        # Mount cache root from host filesystem
+        - name: cache-root
+          hostPath:
+            path: {{ .Values.cacheRoot }}
+            type: DirectoryOrCreate
+        # Optional: mount environment from ConfigMap if assets are defined
+        {{- if .Values.assets }}
+        - name: env-config
+          configMap:
+            name: {{ include "lke-node-cache-manager.fullname" . }}-env
+        {{- end }}
+      containers:
+        - name: cache-manager
+          image: "{{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }}"
+          imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          env:
+            # Core configuration
+            - name: CACHE_PATH
+              value: {{ .Values.cacheRoot | quote }}
+            - name: METRICS_PORT
+              value: {{ .Values.metrics.port | quote }}
+            - name: RECONCILE_INTERVAL_SECONDS
+              value: {{ .Values.reconcileIntervalSeconds | quote }}
+            - name: MIN_FREE_DISK_PERCENT
+              value: {{ .Values.minFreeDiskPercent | quote }}
+            - name: DOWNLOAD_TIMEOUT_SECONDS
+              value: {{ .Values.downloadTimeoutSeconds | quote }}
+            - name: LOG_LEVEL
+              value: "INFO"
+
+            # Credentials (optional)
+            {{- if .Values.credentials.huggingface_token }}
+            - name: HF_TOKEN
+              value: {{ .Values.credentials.huggingface_token | quote }}
+            {{- end }}
+            {{- if .Values.credentials.aws_access_key_id }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.credentials.aws_access_key_id | quote }}
+            {{- end }}
+            {{- if .Values.credentials.aws_secret_access_key }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.credentials.aws_secret_access_key | quote }}
+            {{- end }}
+
+            # Load assets from ConfigMap if present
+            {{- if .Values.assets }}
+            - name: ASSETS_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "lke-node-cache-manager.fullname" . }}-env
+                  key: ASSETS_JSON
+            {{- end }}
+
+          securityContext:
+            # No privilege escalation allowed
+            allowPrivilegeEscalation: false
+            # Drop all capabilities; cache manager needs no special privileges
+            capabilities:
+              drop:
+                - ALL
+
+          # Liveness probe: process is healthy if metrics endpoint responds.
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # Readiness probe: check if metrics endpoint is responding
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 2
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: cache-root
+              mountPath: {{ .Values.cacheRoot }}
+            {{- if .Values.assets }}
+            - name: env-config
+              mountPath: /etc/config
+              readOnly: true
+            {{- end }}
+
+          resources:
+            {{- toYaml .Values.deployment.resources | nindent 12 }}

@@ -1,0 +1,16 @@
+{{- if .Values.assets }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lke-node-cache-manager.fullname" . }}-env
+  labels:
+    {{- include "lke-node-cache-manager.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  # Rendered as JSON for easy parsing in the app
+  ASSETS_JSON: |-
+{{ toPrettyJson .Values.assets | nindent 4 }}
+{{- end }}
